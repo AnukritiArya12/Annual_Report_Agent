@@ -1,13 +1,8 @@
-deepagents
-langchain-ollama
-langchain-openai
-langchain-core
-pydantic
+requests
+beautifulsoup4
+ddgs
+pydantic>=2
 python-dotenv
-chromadb
 pymupdf
 python-docx
 reportlab
-ddgs
-requests
-beautifulsoup4

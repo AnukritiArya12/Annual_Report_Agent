@@ -1,16 +1,6 @@
-# Virtual environment
+.env
+__pycache__/
+*.pyc
+runs/
 .venv/
 venv/
-
-# Python cache
-__pycache__/
-*.py[cod]
-
-# Environment variables
-.env
-
-# IDE
-.vscode/
-
-# Generated outputs
-runs/

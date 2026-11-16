@@ -1,125 +1,120 @@
-"""Dynamic Validation Engine for AI-Based Annual Report Generation System.
+"""Validation engine: grounding, completeness, duplication and criteria checks.
 
-Validates evidence coverage, factual accuracy, numerical integrity, and adherence
-to task-specific validation criteria. If validation fails, provides concrete,
-actionable feedback for agent revision.
+Checks are generic. Nothing here assumes a particular section, industry or country; the
+acceptance criteria come from the planner, per section.
 """
 
+from __future__ import annotations
+
 import re
-from typing import List, Optional
-from config import get_llm
-from schemas import TaskDefinition, TaskOutput, ValidationResult
+from typing import Dict, List
+
+from config import get_llm, settings
+from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult
+from utils import extract_json, shingle_set, word_count
 
 
 class DynamicValidator:
-    """Evaluates task outputs against evidence and explicit validation criteria."""
-
     def __init__(self):
         self.llm = get_llm()
+        self._shingles: Dict[str, set] = {}
 
+    # ----------------------------------------------------------- programmatic
     @staticmethod
-    def _ungrounded_numbers_issue(text: str, output: TaskOutput) -> List[str]:
-        """Flag sections whose figures do not appear in any collected evidence (likely hallucinated)."""
-        evidence_blob = " ".join(e.fact_or_data for e in output.evidence_used).replace(",", "")
-        if not evidence_blob:
+    def _ungrounded_numbers(text: str, output: TaskOutput) -> List[str]:
+        evidence = " ".join(e.text for e in output.evidence_used).replace(",", "")
+        if not evidence:
             return []
         body = text.split("*Sources:")[0].replace(",", "")
         nums = {n for n in re.findall(r"\d+(?:\.\d+)?", body) if len(n.replace(".", "")) >= 3}
-        # years like 2024 / 2025 are not facts to verify
-        nums = {n for n in nums if not (len(n) == 4 and n.startswith(("19", "20")))}
+        nums = {n for n in nums if not (len(n) == 4 and n.startswith(("19", "20")))}   # plain years
         if len(nums) < 5:
             return []
-        missing = [n for n in nums if n not in evidence_blob]
-        if len(missing) / len(nums) > 0.75:
-            return [("Most figures in this section do not appear in collected evidence "
-                     f"(e.g. {', '.join(sorted(missing)[:6])}). Use verified filing numbers or mark "
-                     "'Not disclosed in the public sources reviewed'.")]
+        missing = [n for n in nums if n not in evidence]
+        if len(missing) / len(nums) > 0.6:
+            return [f"Most figures in this section do not appear in the collected evidence (e.g. "
+                    f"{', '.join(sorted(missing)[:6])}). Use only figures present in the evidence, or write "
+                    f"'Not disclosed in the sources reviewed'."]
         return []
 
-    def validate_task_output(self, task: TaskDefinition, output: TaskOutput) -> ValidationResult:
-        """Validates task output against its specific validation criteria and evidence.
-        
-        Args:
-            task: The original task specification with validation_criteria.
-            output: The generated TaskOutput.
-            
-        Returns:
-            ValidationResult with pass/fail status and revision instructions if needed.
-        """
-        print(f"[Validator] Auditing Task: '{task.title}' (ID: {task.task_id})...")
+    def _duplicates(self, task: TaskDefinition, text: str, others: Dict[str, str]) -> List[str]:
+        mine = shingle_set(text)
+        if len(mine) < 30:
+            return []
+        self._shingles[task.task_id] = mine
+        for tid, other_text in others.items():
+            if tid == task.task_id:
+                continue
+            theirs = self._shingles.get(tid)
+            if theirs is None:
+                theirs = self._shingles[tid] = shingle_set(other_text)
+            if len(theirs) < 30:
+                continue
+            containment = len(mine & theirs) / len(mine)
+            if containment > settings.DUPLICATE_CONTAINMENT_LIMIT:
+                return [f"About {containment:.0%} of this section repeats passages already written in another "
+                        f"section (task {tid}). Remove the repeated material, keep only what is unique to this part "
+                        f"and refer to the other section in a clause instead."]
+        return []
 
-        # 1. Structural and completeness checks
+    # ------------------------------------------------------------------ main
+    def validate_task_output(self, task: TaskDefinition, output: TaskOutput,
+                             completed_texts: Dict[str, str]) -> ValidationResult:
         issues: List[str] = []
+        if output.status == TaskStatus.FAILED:
+            return ValidationResult(target_id=task.task_id, is_valid=False,
+                                    issues_found=[output.error_message or "generation failed"],
+                                    revision_instructions=None)
         text = output.markdown_content.strip()
+        words = word_count(text)
+        strong_evidence = len(output.evidence_used) >= 6
 
-        if len(text.split()) < 35:
-            issues.append(f"Content is too brief ({len(text.split())} words); expected comprehensive analysis.")
+        if words < 40:
+            issues.append(f"Section is very short ({words} words).")
+        elif strong_evidence and words < 0.35 * task.target_words:
+            issues.append(f"Section has {words} words but about {task.target_words} are expected and the evidence "
+                          f"contains more material. Cover every point in 'what to cover' using the evidence.")
 
-        # 1b. Grounding check: numbers in the text must come from the gathered evidence
-        issues.extend(self._ungrounded_numbers_issue(text, output))
+        issues += self._ungrounded_numbers(text, output)
+        issues += self._duplicates(task, text, completed_texts)
 
-        # 2. Check each validation criterion
         for criterion in task.validation_criteria:
-            c_lower = criterion.lower()
-            
-            # Table / matrix check
-            if any(term in c_lower for term in ["table", "matrix"]):
-                has_table_pipes = ("|" in text and "---" in text)
-                has_rows = len([l for l in text.splitlines() if "|" in l]) >= 3
-                if not (has_table_pipes and has_rows):
-                    issues.append(f"Missing required structured table or comparison matrix: '{criterion}'. Provide a Markdown table with headers, separator, and data rows.")
-                
-            # Currency or figures check
-            if any(term in c_lower for term in ["revenue", "profit", "figures", "currency"]):
-                has_numbers = bool(re.search(r"(\$|₹|€|£|\%|\d+\s*(?:cr|crore|billion|million))", text, re.IGNORECASE))
-                if not has_numbers and not any(k in text.lower() for k in ["disclosed", "statutory", "n/a", "filing"]):
-                    issues.append(f"Missing quantitative figures or disclosure status: '{criterion}'")
+            if any(w in criterion.lower() for w in ("table", "matrix")):
+                rows = [l for l in text.splitlines() if l.strip().startswith("|")]
+                if len(rows) < 3 or "---" not in text:
+                    issues.append(f"Missing required table: '{criterion}'. Provide a Markdown table (header, "
+                                  f"separator, data rows) or write 'Not disclosed in the sources reviewed'.")
 
-            # Footprint / identity check
-            if "footprint" in c_lower and not any(term in text.lower() for term in ["global", "presence", "offices", "centers", "delivery", "headquarters"]):
-                issues.append(f"Missing global footprint details: '{criterion}'")
+        if not issues and settings.VALIDATE_WITH_LLM and task.validation_criteria:
+            issues += self._llm_review(task, output, text)
 
-        # 3. LLM verification if available
-        if not issues:
-            system_prompt = (
-                "You are a Senior Regulatory Audit & Compliance Officer.\n"
-                "Review the draft annual report section against the required validation criteria.\n"
-                "If it satisfies all criteria, respond with 'PASS'.\n"
-                "If it fails any criterion, respond with 'FAIL:' followed by specific revision instructions."
-            )
-            user_prompt = f"""Task: {task.title}
-Required Criteria:
-{chr(10).join(f"- {c}" for c in task.validation_criteria)}
+        ok = not issues
+        revision = None if ok else "Revise this section to resolve:\n" + "\n".join(f"- {i}" for i in issues)
+        print(f"[Validator] {'PASS' if ok else 'REVISE'} '{task.title}'" + ("" if ok else f": {issues}"))
+        return ValidationResult(target_id=task.task_id, is_valid=ok, issues_found=issues,
+                                revision_instructions=revision)
 
-Draft Section:
-{text[:2000]}
-"""
-            try:
-                resp = self.llm.invoke([
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ])
-                verdict = resp.content.strip()
-                if verdict.upper().startswith("FAIL"):
-                    issues.append(verdict.replace("FAIL:", "").strip())
-            except Exception:
-                # LLM offline or unreachable, rely on programmatic checks
-                pass
+    def _llm_review(self, task: TaskDefinition, output: TaskOutput, text: str) -> List[str]:
+        evid = "\n".join(f"[{i+1}] {e.text[:350]}" for i, e in enumerate(output.evidence_used[:8]))
+        system = ("You are a strict annual-report audit reviewer. Judge ONLY the two things asked. "
+                  "Return ONLY JSON: {\"verdict\": \"PASS\" | \"FAIL\", \"issues\": [\"...\"]}.")
+        user = f"""Section: {task.title}
+Acceptance criteria:
+{chr(10).join('- ' + c for c in task.validation_criteria)}
 
-        is_valid = len(issues) == 0
-        score = 1.0 if is_valid else max(0.2, 1.0 - (len(issues) * 0.25))
+1. Does the draft satisfy every criterion (a criterion is also satisfied by an honest 'Not disclosed in the sources reviewed')?
+2. Does the draft state specific facts or figures that clearly contradict or are absent from the evidence excerpts?
 
-        revision_text = None
-        if not is_valid:
-            revision_text = "Please revise this section to resolve the following issues:\n" + "\n".join(f"- {i}" for i in issues)
-            print(f"[Validator] REVISION REQUESTED for '{task.title}': {issues}")
-        else:
-            print(f"[Validator] PASSED: Task '{task.title}' satisfies all validation criteria.")
+Evidence excerpts:
+{evid or '(none)'}
 
-        return ValidationResult(
-            target_id=task.task_id,
-            is_valid=is_valid,
-            factual_accuracy_score=score,
-            issues_found=issues,
-            revision_instructions=revision_text
-        )
+Draft:
+{text[:7000]}"""
+        try:
+            data = extract_json(self.llm.invoke([{"role": "system", "content": system},
+                                                 {"role": "user", "content": user}], max_tokens=800).content)
+            if isinstance(data, dict) and str(data.get("verdict", "")).upper().startswith("FAIL"):
+                return [str(i) for i in (data.get("issues") or ["Reviewer rejected the section."])][:4]
+        except Exception:
+            pass          # reviewer unavailable: rely on the programmatic checks above
+        return []

@@ -1,804 +1,484 @@
-"""Report Assembly & Document Generation Module.
+"""Report assembly and export (Markdown -> DOCX and PDF).
 
-Assembles validated chapters, structured tables, and evidence citations into a cohesive
-annual report. Exports formatted Markdown, professional DOCX, and publication-ready PDF documents.
+Headings follow the planner's tree (chapter > section > sub-section), so the document structure is
+whatever the planner decided for this company. Both exporters build a real table of contents with
+page numbers (PDF) or a Word TOC field (DOCX).
 """
+
+from __future__ import annotations
 
 import os
 import re
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Any
-from docx import Document
-from docx.shared import Inches, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml import parse_xml
-from docx.oxml.ns import nsdecls
+from typing import Any, Dict, List, Optional, Tuple
 
-from schemas import ReportBlueprint, TaskOutput
+from schemas import ReportBlueprint, TaskOutput, TaskStatus
 from tools import ResearchTools
 
 
-def is_table_line(line: str) -> bool:
-    """Detect whether a line is part of a markdown table."""
+# ------------------------------------------------------------------------------
+# Markdown block parser (shared by DOCX and PDF exporters)
+# ------------------------------------------------------------------------------
+def _split_row(line: str) -> List[str]:
     s = line.strip()
-    if not s:
-        return False
-    if s.startswith("|") and s.endswith("|"):
-        return True
-    if "|" in s and not s.startswith("#"):
-        # Check if it has at least 2 cells
-        parts = [p.strip() for p in s.split("|")]
-        return len(parts) >= 2
-    return False
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
 
 
-def parse_markdown_table(rows_text: List[str]) -> Dict[str, Any]:
-    """Parses markdown table lines into headers, rows, and inferred column alignments."""
-    raw_rows = []
-    for line in rows_text:
-        s = line.strip()
-        if s.startswith("|") and s.endswith("|"):
-            s = s[1:-1]
-        elif s.startswith("|"):
-            s = s[1:]
-        elif s.endswith("|"):
-            s = s[:-1]
-        cells = [c.strip() for c in s.split("|")]
-        raw_rows.append(cells)
+def parse_markdown_blocks(md: str) -> List[Tuple]:
+    """Returns blocks: ('h', level, text) ('p', text) ('ul', [items]) ('ol', [items])
+    ('table', rows, aligns) ('hr',) ('quote', text)."""
+    lines = md.splitlines()
+    blocks: List[Tuple] = []
+    i, para = 0, []
 
-    if not raw_rows:
-        return {"headers": [], "rows": [], "all_rows": [], "alignments": [], "num_cols": 0}
+    def flush():
+        nonlocal para
+        if para:
+            blocks.append(("p", " ".join(s.strip() for s in para)))
+            para = []
 
-    # Filter out separator row while extracting column alignments
-    alignments = []
-    filtered_rows = []
-    for row in raw_rows:
-        if all(re.match(r"^:?-{2,}:?$", c) for c in row if c):
-            for c in row:
-                c_clean = c.strip()
-                if c_clean.startswith(":") and c_clean.endswith(":"):
-                    alignments.append("center")
-                elif c_clean.endswith(":"):
-                    alignments.append("right")
-                else:
-                    alignments.append("left")
+    while i < len(lines):
+        ln = lines[i]
+        s = ln.strip()
+        if not s:
+            flush(); i += 1; continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", s)
+        if m:
+            flush(); blocks.append(("h", len(m.group(1)), m.group(2).strip())); i += 1; continue
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", s):
+            flush(); blocks.append(("hr",)); i += 1; continue
+        if s.startswith("|"):
+            flush()
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(lines[i]); i += 1
+            parsed, aligns = [], []
+            for r in rows:
+                cells = _split_row(r)
+                if cells and all(re.match(r"^:?-{2,}:?$", c) for c in cells if c):
+                    aligns = ["right" if c.endswith(":") and not c.startswith(":") else
+                              "center" if c.startswith(":") and c.endswith(":") else "left" for c in cells]
+                    continue
+                parsed.append(cells)
+            if parsed:
+                n = max(len(r) for r in parsed)
+                parsed = [r + [""] * (n - len(r)) for r in parsed]
+                aligns = (aligns + ["left"] * n)[:n]
+                blocks.append(("table", parsed, aligns))
             continue
-        filtered_rows.append(row)
-
-    if not filtered_rows:
-        return {"headers": [], "rows": [], "all_rows": [], "alignments": [], "num_cols": 0}
-
-    num_cols = max(len(r) for r in filtered_rows)
-    # Pad all rows to uniform num_cols
-    norm_rows = []
-    for r in filtered_rows:
-        padded = r + [""] * (num_cols - len(r))
-        norm_rows.append(padded)
-
-    headers = norm_rows[0]
-    data_rows = norm_rows[1:] if len(norm_rows) > 1 else []
-
-    while len(alignments) < num_cols:
-        alignments.append("left")
-
-    # Infer right-alignment for columns containing numbers/currencies/percentages
-    for col_idx in range(num_cols):
-        col_vals = [r[col_idx] for r in data_rows if r[col_idx]]
-        if col_vals and all(re.match(r"^[\$₹€£]?\s*[\(\-]?\d+(?:[\.,]\d+)?%?\)?\s*(?:cr|crore|billion|million|k|m|b)?$", v.replace("**", "").replace("*", "").strip(), re.I) for v in col_vals):
-            if alignments[col_idx] == "left":
-                alignments[col_idx] = "right"
-
-    return {
-        "headers": headers,
-        "rows": data_rows,
-        "all_rows": norm_rows,
-        "alignments": alignments,
-        "num_cols": num_cols
-    }
+        if re.match(r"^[-*+]\s+", s):
+            flush(); items = []
+            while i < len(lines) and re.match(r"^\s*[-*+]\s+", lines[i]):
+                items.append(re.sub(r"^\s*[-*+]\s+", "", lines[i]).strip()); i += 1
+            blocks.append(("ul", items)); continue
+        if re.match(r"^\d+[\.\)]\s+", s):
+            flush(); items = []
+            while i < len(lines) and re.match(r"^\s*\d+[\.\)]\s+", lines[i]):
+                items.append(re.sub(r"^\s*\d+[\.\)]\s+", "", lines[i]).strip()); i += 1
+            blocks.append(("ol", items)); continue
+        if s.startswith(">"):
+            flush(); blocks.append(("quote", s.lstrip("> ").strip())); i += 1; continue
+        para.append(ln); i += 1
+    flush()
+    return blocks
 
 
-def extract_structured_tables(markdown_text: str) -> List[Dict[str, Any]]:
-    """Extracts all markdown tables from text as structured dicts."""
-    lines = markdown_text.split("\n")
-    tables = []
-    current_rows = []
-    in_table = False
-    current_title = ""
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("###") or stripped.startswith("####"):
-            current_title = stripped.lstrip("#").strip()
-
-        if is_table_line(stripped):
-            in_table = True
-            current_rows.append(stripped)
+def _inline_runs(text: str) -> List[Tuple[str, bool, bool]]:
+    """Split inline markdown into (text, bold, italic) runs. Links keep their text only."""
+    text = re.sub(r"\[([^\]]+)\]\((?:[^)]+)\)", r"\1", text)
+    text = text.replace("`", "")
+    runs: List[Tuple[str, bool, bool]] = []
+    for part in re.split(r"(\*\*[^*]+\*\*|\*[^*]+\*)", text):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            runs.append((part[2:-2], True, False))
+        elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+            runs.append((part[1:-1], False, True))
         else:
-            if in_table and current_rows:
-                parsed = parse_markdown_table(current_rows)
-                if parsed["headers"]:
-                    tables.append({
-                        "title": current_title,
-                        "headers": parsed["headers"],
-                        "rows": parsed["rows"],
-                        "alignments": parsed["alignments"],
-                        "num_cols": parsed["num_cols"]
-                    })
-                current_rows = []
-                in_table = False
-
-    if in_table and current_rows:
-        parsed = parse_markdown_table(current_rows)
-        if parsed["headers"]:
-            tables.append({
-                "title": current_title,
-                "headers": parsed["headers"],
-                "rows": parsed["rows"],
-                "alignments": parsed["alignments"],
-                "num_cols": parsed["num_cols"]
-            })
-
-    return tables
+            runs.append((part, False, False))
+    return runs
 
 
+def _replace_toc_with_marker(blocks: List[Tuple]) -> List[Tuple]:
+    """Replace the static 'Table of Contents' list in the markdown with a ('toc',) marker."""
+    for idx, b in enumerate(blocks):
+        if b[0] == "h" and b[2].strip().lower() == "table of contents":
+            end = idx + 1
+            while end < len(blocks) and blocks[end][0] != "hr":
+                end += 1
+            return blocks[:idx] + [("toc",)] + blocks[end + 1:]
+    return blocks
+
+
+# ------------------------------------------------------------------------------
 class ReportAssembler:
-    """Assembles validated task outputs into final publishable annual reports."""
-
     def __init__(self, tools: Optional[ResearchTools] = None):
         self.tools = tools
 
-    def assemble_markdown(
-        self,
-        blueprint: ReportBlueprint,
-        task_outputs: Dict[str, TaskOutput],
-        output_file: str
-    ) -> str:
-        """Assembles all validated task outputs into a unified Markdown report file."""
-        profile = blueprint.company_profile
-        spec = blueprint.input_spec
+    # ---------------------------------------------------------------- markdown
+    def assemble_markdown(self, blueprint: ReportBlueprint, outputs: Dict[str, TaskOutput], out_file: str) -> str:
+        p, spec = blueprint.company_profile, blueprint.input_spec
+        L: List[str] = []
+        L.append(f"# {p.company_name} - Annual Report {spec.financial_year}")
+        L.append(f"**Reporting scope:** {spec.reporting_scope}\n")
+        if p.country:
+            L.append(f"**Jurisdiction:** {p.country}\n")
+        if p.industry and p.industry != "Unknown":
+            L.append(f"**Industry:** {p.industry}\n")
+        if p.listing_status:
+            L.append(f"**Listing:** {p.listing_status}\n")
+        L.append(f"*Generated {datetime.now(timezone.utc).strftime('%d %B %Y')} by an AI report agent from public sources*\n")
+        L.append("---\n")
 
-        lines = []
-        # Title Block
-        lines.append(f"# ANNUAL REPORT: {profile.company_name.upper()}")
-        lines.append(f"**Financial Year**: {spec.financial_year} | **Reporting Scope**: {spec.reporting_scope}")
-        lines.append(f"**Jurisdiction**: {profile.country} | **Industry Sector**: {profile.industry}")
-        lines.append(f"**Listing**: {profile.listing_status}")
-        lines.append(f"*Generated on: {datetime.now(timezone.utc).strftime('%B %d, %Y')}*\n")
-        lines.append("---\n")
+        L.append("## Table of Contents")
+        chapters = sorted(blueprint.chapters, key=lambda c: c.sequence_order)
+        for ch in chapters:
+            L.append(f"- {ch.title}")
+        L.append("- Basis of Preparation & Sources")
+        L.append("\n---\n")
 
-        # Table of Contents
-        lines.append("## Table of Contents")
-        for chapter in sorted(blueprint.chapters, key=lambda c: c.sequence_order):
-            lines.append(f"- [{chapter.title}](#{chapter.chapter_id})")
-        lines.append("- [Statutory Disclosures & Compliance Statement](#statutory-disclosures)")
-        lines.append("- [Evidence Sources & Regulatory Filings](#evidence-sources)")
-        lines.append("\n---\n")
-
-        # Chapter Content
-        for chapter in sorted(blueprint.chapters, key=lambda c: c.sequence_order):
-            lines.append(f"## <a id='{chapter.chapter_id}'></a>{chapter.title}\n")
-            if chapter.objective:
-                lines.append(f"> *{chapter.objective}*\n")
-
-            for tid in chapter.task_ids:
-                output = task_outputs.get(tid)
-                if output and output.markdown_content:
-                    lines.append(output.markdown_content.strip())
-                    lines.append("\n")
+        tasks = {t.task_id: t for t in blueprint.tasks}
+        failed: List[str] = []
+        for ch in chapters:
+            emitted: List[str] = []
+            for tid in ch.task_ids:
+                t = tasks[tid]
+                path = t.path
+                for depth, title in enumerate(path):
+                    if len(emitted) > depth and emitted[depth] == title and emitted[:depth] == path[:depth]:
+                        continue
+                    L.append(f"{'#' * min(6, depth + 2)} {title}\n")
+                    emitted = path[:depth] + [title]
+                out = outputs.get(tid)
+                if out and out.markdown_content.strip():
+                    if out.status == TaskStatus.FAILED:
+                        failed.append(" > ".join(path))
+                    L.append(self._demote_headings(out.markdown_content.strip(), len(path)))
                 else:
-                    lines.append(f"*(Section {tid} under preparation)*\n")
+                    failed.append(" > ".join(path))
+                    L.append("*(This section was not generated.)*")
+                L.append("")
+            L.append("---\n")
 
-            lines.append("---\n")
-
-        # Statutory Disclosures Appendix
-        lines.append("## <a id='statutory-disclosures'></a>Statutory Disclosures & Compliance Statement\n")
-        regs = ', '.join(profile.applicable_regulations) if profile.applicable_regulations else 'Applicable statutory standards'
-        lines.append(
-            f"This Annual Report has been prepared in conformance with recognized disclosure frameworks, "
-            f"including {regs}. All factual representations and numerical metrics are supported by corporate filings, "
-            f"official investor communications, and verified public records.\n"
-        )
-        lines.append("---\n")
-
-        # Evidence & Sources Appendix
-        lines.append("## <a id='evidence-sources'></a>Evidence Sources & Regulatory Filings\n")
-        all_evidence = []
-        for tid, out in task_outputs.items():
-            if out and hasattr(out, "evidence_used"):
-                all_evidence.extend(out.evidence_used)
-
-        # Unique sources by URL
-        seen_urls = set()
-        unique_sources = []
-        for ev in all_evidence:
-            if ev.source_url and ev.source_url not in seen_urls:
-                seen_urls.add(ev.source_url)
-                unique_sources.append(ev)
-
-        if unique_sources:
-            lines.append("| Index | Source Title | Reference URL | Verification Confidence |")
-            lines.append("| :--- | :--- | :--- | :--- |")
-            for idx, ev in enumerate(unique_sources[:40], 1):
-                clean_title = (ev.source_title or "Official Filing").replace("|", "-")
-                lines.append(f"| [{idx}] | {clean_title} | [{ev.source_url}]({ev.source_url}) | {ev.confidence:.0%} |")
-            lines.append("\n")
+        L.append("## Basis of Preparation & Sources")
+        L.append("This report was drafted by an automated agent from publicly available documents. It has not been "
+                 "audited or approved by the company. Figures must be verified against the company's official filings "
+                 "before any reliance. Where the sources did not contain an item, the text says "
+                 "\"Not disclosed in the sources reviewed\".\n")
+        if blueprint.reference_documents:
+            L.append("**Reference documents used for structure and content:**\n")
+            for d in blueprint.reference_documents:
+                note = "" if d.matches_requested_period else " - NOTE: period may differ from the requested year"
+                L.append(f"- {d.title}{(' (' + d.url + ')') if d.url else ''}{note}")
         else:
-            lines.append("*Primary corporate filings, investor releases, and statutory records.*")
+            L.append("No reference report could be loaded; content comes from web search results only.")
+        if p.applicable_regulations:
+            L.append(f"\n**Frameworks identified as applicable:** {', '.join(p.applicable_regulations)}")
+        if failed:
+            L.append("\n**Sections that could not be generated:**\n")
+            L += [f"- {f}" for f in failed]
+        os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(L) + "\n")
+        print(f"[Assembler] Markdown written: {out_file}")
+        return out_file
 
-        content = "\n".join(lines)
-        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(content)
+    @staticmethod
+    def _demote_headings(text: str, depth: int) -> str:
+        """Writer sub-headings must sit below the section heading (which is at level depth+1)."""
+        def fix(m):
+            level = len(m.group(1))
+            return "#" * min(6, max(level, depth + 2)) + " " + m.group(2)
+        return re.sub(r"^(#{1,6})\s+(.*)$", fix, text, flags=re.M)
 
-        print(f"\n[Assembler] Successfully generated unified Markdown report: {output_file}")
-        return output_file
+    # -------------------------------------------------------------------- DOCX
+    def export_docx(self, markdown_file: str, docx_file: str, title: str) -> str:
+        from docx import Document
+        from docx.enum.table import WD_TABLE_ALIGNMENT
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml import OxmlElement, parse_xml
+        from docx.oxml.ns import nsdecls, qn
+        from docx.shared import Inches, Pt, RGBColor
 
-    def export_docx(self, markdown_file: str, docx_file: str, title: str = "Annual Report") -> str:
-        """Exports the annual report as a styled corporate Word (.docx) document."""
         with open(markdown_file, "r", encoding="utf-8") as f:
-            content = f.read()
+            blocks = _replace_toc_with_marker(parse_markdown_blocks(f.read()))
 
         doc = Document()
+        sec = doc.sections[0]
+        sec.left_margin = sec.right_margin = Inches(1)
+        sec.top_margin = sec.bottom_margin = Inches(0.9)
+        normal = doc.styles["Normal"]
+        normal.font.name = "Calibri"
+        normal.font.size = Pt(10.5)
+        for lvl, size in ((1, 20), (2, 15), (3, 12.5)):
+            st = doc.styles[f"Heading {lvl}"]
+            st.font.name = "Calibri"
+            st.font.size = Pt(size)
+            st.font.color.rgb = RGBColor(0x1A, 0x36, 0x5D)
 
-        # Page Setup: Standard 1-inch margins
-        for section in doc.sections:
-            section.top_margin = Inches(1.0)
-            section.bottom_margin = Inches(1.0)
-            section.left_margin = Inches(1.0)
-            section.right_margin = Inches(1.0)
+        def field(par, instr: str, placeholder: str = ""):
+            r = par.add_run()
+            for kind in ("begin", None, "separate", "text", "end"):
+                if kind == "text":
+                    t = OxmlElement("w:t"); t.text = placeholder; r._r.append(t)
+                elif kind is None:
+                    it = OxmlElement("w:instrText"); it.set(qn("xml:space"), "preserve"); it.text = instr; r._r.append(it)
+                else:
+                    fc = OxmlElement("w:fldChar"); fc.set(qn("w:fldCharType"), kind); r._r.append(fc)
 
-        # Document Title
-        title_p = doc.add_paragraph()
-        title_p.paragraph_format.space_before = Pt(12)
-        title_p.paragraph_format.space_after = Pt(12)
-        title_p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title_p.add_run(title)
-        run.bold = True
-        run.font.size = Pt(24)
-        run.font.color.rgb = RGBColor(26, 54, 93)  # Navy Blue
+        # footer with page numbers
+        fp = sec.footer.paragraphs[0]
+        fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        fp.add_run(f"{title}  |  Page ").font.size = Pt(8)
+        field(fp, "PAGE", "1")
 
-        lines = content.split("\n")
-        in_table = False
-        table_rows = []
+        def add_runs(par, text, size=None, color=None, force_bold=False):
+            for t, b, it in _inline_runs(text):
+                r = par.add_run(t)
+                r.bold = b or force_bold
+                r.italic = it
+                if size:
+                    r.font.size = size
+                if color:
+                    r.font.color.rgb = color
 
-        for line in lines:
-            stripped = line.strip()
-
-            if stripped.startswith("# ") and title.lower() in stripped.lower():
-                continue
-
-            # Markdown Table detection
-            if is_table_line(stripped):
-                in_table = True
-                table_rows.append(stripped)
-                continue
-            elif in_table:
-                self._render_docx_table(doc, table_rows)
-                in_table = False
-                table_rows = []
-
-            # Heading 1
-            if stripped.startswith("# "):
-                h = doc.add_heading(stripped[2:], level=1)
-                h.paragraph_format.space_before = Pt(16)
-                h.paragraph_format.space_after = Pt(6)
-            # Heading 2 (Major Chapter – start on new page)
-            elif stripped.startswith("## "):
-                doc.add_page_break()
-                clean_h2 = re.sub(r"<a[^>]*></a>", "", stripped[3:]).strip()
-                h = doc.add_heading(clean_h2, level=2)
-                h.paragraph_format.space_before = Pt(12)
-                h.paragraph_format.space_after = Pt(4)
-            # Heading 3
-            elif stripped.startswith("### "):
-                h = doc.add_heading(stripped[4:], level=3)
-                h.paragraph_format.space_before = Pt(10)
-                h.paragraph_format.space_after = Pt(3)
-            # Bullet point
-            elif stripped.startswith("- ") or stripped.startswith("* "):
-                p = doc.add_paragraph(style="List Bullet")
-                self._add_formatted_runs(p, stripped[2:])
-            # Horizontal rule
-            elif stripped in ("---", "***", "___"):
+        for b in blocks:
+            kind = b[0]
+            if kind == "h":
+                lvl, text = b[1], re.sub(r"<[^>]+>", "", b[2])
+                if lvl == 1:
+                    p = doc.add_paragraph(style="Title")
+                    add_runs(p, text)
+                elif lvl == 2:
+                    h = doc.add_heading(level=1)
+                    add_runs(h, text)
+                    h.paragraph_format.page_break_before = True
+                elif lvl == 3:
+                    add_runs(doc.add_heading(level=2), text)
+                else:
+                    add_runs(doc.add_heading(level=3), text)
+            elif kind == "toc":
+                h = doc.add_paragraph()
+                add_runs(h, "Table of Contents", size=Pt(16), color=RGBColor(0x1A, 0x36, 0x5D), force_bold=True)
+                h.paragraph_format.page_break_before = True
                 p = doc.add_paragraph()
-                p.paragraph_format.space_before = Pt(6)
-                p.paragraph_format.space_after = Pt(6)
-            # Standard paragraph
-            elif stripped:
+                field(p, 'TOC \\o "1-2" \\h \\z \\u', "Right-click here and choose 'Update Field' to build the table of contents.")
+                settings_el = doc.settings.element
+                upd = OxmlElement("w:updateFields"); upd.set(qn("w:val"), "true")
+                settings_el.append(upd)
+            elif kind == "p":
                 p = doc.add_paragraph()
+                add_runs(p, b[1])
                 p.paragraph_format.space_after = Pt(6)
-                self._add_formatted_runs(p, stripped)
-
-        if in_table and table_rows:
-            self._render_docx_table(doc, table_rows)
-
+            elif kind in ("ul", "ol"):
+                for item in b[1]:
+                    p = doc.add_paragraph(style="List Bullet" if kind == "ul" else "List Number")
+                    add_runs(p, item)
+            elif kind == "quote":
+                p = doc.add_paragraph()
+                add_runs(p, b[1])
+                for r in p.runs:
+                    r.italic = True
+            elif kind == "table":
+                self._docx_table(doc, b[1], b[2], parse_xml, nsdecls, Inches, Pt, RGBColor, WD_TABLE_ALIGNMENT, add_runs)
         os.makedirs(os.path.dirname(os.path.abspath(docx_file)), exist_ok=True)
         doc.save(docx_file)
-        print(f"[Assembler] Exported professional DOCX report: {docx_file}")
+        print(f"[Assembler] DOCX written: {docx_file}")
         return docx_file
 
-    def export_pdf(self, markdown_file: str, pdf_file: str, title: str = "Annual Report") -> str:
-        """Exports the annual report as a professional PDF."""
-        try:
-            return self._export_pdf_reportlab(markdown_file, pdf_file, title)
-        except Exception as e:
-            print(f"[Assembler] ReportLab PDF generation fallback ({e}); using built-in engine.")
-            return self._export_pdf_builtin(markdown_file, pdf_file, title)
-
-    def _export_pdf_reportlab(self, markdown_file: str, pdf_file: str, title: str) -> str:
-        """ReportLab publisher for high-quality corporate PDF documents."""
-        from reportlab.lib.pagesizes import letter
-        from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-        )
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib import colors
-
-        with open(markdown_file, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        os.makedirs(os.path.dirname(os.path.abspath(pdf_file)), exist_ok=True)
-        doc = SimpleDocTemplate(
-            pdf_file,
-            pagesize=letter,
-            leftMargin=54,
-            rightMargin=54,
-            topMargin=54,
-            bottomMargin=54
-        )
-
-        styles = getSampleStyleSheet()
-
-        # Corporate Typography Styles
-        title_style = ParagraphStyle(
-            "DocTitle",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=22,
-            leading=26,
-            textColor=colors.HexColor("#1A365D"),
-            alignment=1,  # Center
-            spaceAfter=15
-        )
-        h1_style = ParagraphStyle(
-            "DocH1",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=15,
-            leading=18,
-            textColor=colors.HexColor("#1A365D"),
-            spaceBefore=14,
-            spaceAfter=6
-        )
-        h2_style = ParagraphStyle(
-            "DocH2",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=12,
-            leading=15,
-            textColor=colors.HexColor("#2C5282"),
-            spaceBefore=10,
-            spaceAfter=4
-        )
-        body_style = ParagraphStyle(
-            "DocBody",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=9.5,
-            leading=13.5,
-            textColor=colors.HexColor("#2D3748"),
-            spaceAfter=6
-        )
-        bullet_style = ParagraphStyle(
-            "DocBullet",
-            parent=body_style,
-            leftIndent=15,
-            firstLineIndent=-10,
-            spaceAfter=3
-        )
-
-        story = []
-        # Main Title
-        story.append(Paragraph(self._md_to_html_entities(title), title_style))
-        story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#1A365D"), spaceAfter=15))
-
-        lines = content.split("\n")
-        in_table = False
-        table_rows = []
-
-        for line in lines:
-            stripped = line.strip()
-
-            if stripped.startswith("# ") and title.lower() in stripped.lower():
-                continue
-
-            if is_table_line(stripped):
-                in_table = True
-                table_rows.append(stripped)
-                continue
-            elif in_table:
-                t_flowable = self._build_reportlab_table(table_rows, colors)
-                if t_flowable:
-                    story.append(t_flowable)
-                    story.append(Spacer(1, 10))
-                in_table = False
-                table_rows = []
-
-            if stripped.startswith("# "):
-                clean_h1 = self._md_to_html_entities(stripped[2:])
-                story.append(Paragraph(clean_h1, h1_style))
-            elif stripped.startswith("## "):
-                clean_h2 = re.sub(r"<a[^>]*></a>", "", stripped[3:]).strip()
-                story.append(Paragraph(self._md_to_html_entities(clean_h2), h1_style))
-            elif stripped.startswith("### "):
-                clean_h3 = self._md_to_html_entities(stripped[4:])
-                story.append(Paragraph(clean_h3, h2_style))
-            elif stripped.startswith("- ") or stripped.startswith("* "):
-                clean_b = self._md_to_html_entities(stripped[2:])
-                story.append(Paragraph(f"&bull; {clean_b}", bullet_style))
-            elif stripped in ("---", "***", "___"):
-                story.append(Spacer(1, 4))
-                story.append(HRFlowable(width="100%", thickness=0.8, color=colors.HexColor("#CBD5E0"), spaceAfter=8))
-            elif stripped:
-                clean_p = self._md_to_html_entities(stripped)
-                story.append(Paragraph(clean_p, body_style))
-
-        if in_table and table_rows:
-            t_flowable = self._build_reportlab_table(table_rows, colors)
-            if t_flowable:
-                story.append(t_flowable)
-
-        doc.build(story)
-        print(f"[Assembler] Exported professional PDF report: {pdf_file}")
-        return pdf_file
-
-    def _build_reportlab_table(self, rows_text: List[str], colors):
-        """Converts Markdown table rows to a publication-grade ReportLab Table flowable."""
-        from reportlab.platypus import Table, TableStyle, Paragraph
-        from reportlab.lib.styles import ParagraphStyle
-        from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
-
-        table_data = parse_markdown_table(rows_text)
-        all_rows = table_data["all_rows"]
-        if not all_rows:
-            return None
-
-        num_cols = table_data["num_cols"]
-        alignments = table_data["alignments"]
-
-        # Printable width: letter (612) minus margins (54 * 2) = 504 pt
-        total_width = 504.0
-        col_weights = []
-        for c_idx in range(num_cols):
-            max_len = max(len(row[c_idx]) for row in all_rows)
-            col_weights.append(max(10, min(max_len, 40)))
-        sum_weights = sum(col_weights) or 1
-        col_widths = [(w / sum_weights) * total_width for w in col_weights]
-
-        head_left = ParagraphStyle("THL", fontName="Helvetica-Bold", fontSize=9, leading=11, textColor=colors.white, alignment=TA_LEFT)
-        head_right = ParagraphStyle("THR", fontName="Helvetica-Bold", fontSize=9, leading=11, textColor=colors.white, alignment=TA_RIGHT)
-        head_center = ParagraphStyle("THC", fontName="Helvetica-Bold", fontSize=9, leading=11, textColor=colors.white, alignment=TA_CENTER)
-
-        cell_left = ParagraphStyle("TCL", fontName="Helvetica", fontSize=8.5, leading=11, textColor=colors.HexColor("#2D3748"), alignment=TA_LEFT)
-        cell_right = ParagraphStyle("TCR", fontName="Helvetica", fontSize=8.5, leading=11, textColor=colors.HexColor("#2D3748"), alignment=TA_RIGHT)
-        cell_center = ParagraphStyle("TCC", fontName="Helvetica", fontSize=8.5, leading=11, textColor=colors.HexColor("#2D3748"), alignment=TA_CENTER)
-
-        formatted_table = []
-        for row_idx, row in enumerate(all_rows):
-            is_header = (row_idx == 0)
-            is_total = not is_header and any("total" in c.lower() for c in row)
-            row_cells = []
-            for col_idx, cell_val in enumerate(row):
-                align = alignments[col_idx] if col_idx < len(alignments) else "left"
-                clean_val = self._md_to_html_entities(cell_val)
-                if is_total and not clean_val.startswith("<b>"):
-                    clean_val = f"<b>{clean_val}</b>"
-
-                if is_header:
-                    if align == "right":
-                        st = head_right
-                    elif align == "center":
-                        st = head_center
-                    else:
-                        st = head_left
-                elif align == "right":
-                    st = cell_right
-                elif align == "center":
-                    st = cell_center
-                else:
-                    st = cell_left
-
-                row_cells.append(Paragraph(clean_val, st))
-            formatted_table.append(row_cells)
-
-        t = Table(formatted_table, colWidths=col_widths, repeatRows=1)
-        style_commands = [
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1A365D")),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('TOPPADDING', (0, 0), (-1, -1), 5),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-            ('LEFTPADDING', (0, 0), (-1, -1), 6),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0")),
-            ('LINEBELOW', (0, 0), (-1, 0), 1.2, colors.HexColor("#0F223D")),
-        ]
-
-        # Accentuate total / subtotal rows
-        for r_idx, row in enumerate(all_rows[1:], 1):
-            if any("total" in c.lower() for c in row):
-                style_commands.append(('LINEABOVE', (0, r_idx), (-1, r_idx), 1.0, colors.HexColor("#718096")))
-                style_commands.append(('BACKGROUND', (0, r_idx), (-1, r_idx), colors.HexColor("#EDF2F7")))
-
-        t.setStyle(TableStyle(style_commands))
-        return t
-
-    def _export_pdf_builtin(self, markdown_file: str, pdf_file: str, title: str) -> str:
-        """Lightweight built-in PDF generator with formatted ASCII table support."""
-        with open(markdown_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        clean_lines = []
-        in_table = False
-        table_rows = []
-
-        for l in lines:
-            line = l.strip()
-            if not line:
-                if in_table and table_rows:
-                    clean_lines.extend(self._format_ascii_table(table_rows))
-                    in_table = False
-                    table_rows = []
-                clean_lines.append("")
-                continue
-
-            if is_table_line(line):
-                in_table = True
-                table_rows.append(line)
-                continue
-            elif in_table:
-                clean_lines.extend(self._format_ascii_table(table_rows))
-                in_table = False
-                table_rows = []
-
-            # Clean markdown markers
-            line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
-            line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
-            line = re.sub(r"^#+\s*", "", line)
-            clean_lines.append(line)
-
-        if in_table and table_rows:
-            clean_lines.extend(self._format_ascii_table(table_rows))
-
-        lines_per_page = 46
-        pages = [clean_lines[i:i + lines_per_page] for i in range(0, max(1, len(clean_lines)), lines_per_page)]
-
-        pdf_objects = []
-        pdf_objects.append("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj")
-        page_refs = " ".join(f"{3 + i * 2} 0 R" for i in range(len(pages)))
-        pdf_objects.append(f"2 0 obj\n<< /Type /Pages /Kids [{page_refs}] /Count {len(pages)} >>\nendobj")
-
-        for idx, page_lines in enumerate(pages):
-            page_obj_num = 3 + idx * 2
-            stream_obj_num = page_obj_num + 1
-
-            text_ops = [
-                "BT",
-                "/F1 9 Tf",
-                "14 TL",
-                "54 740 Td"
-            ]
-            for pl in page_lines:
-                safe_txt = pl.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-                safe_txt = safe_txt.encode("ascii", "replace").decode("ascii")
-                text_ops.append(f"({safe_txt}) '")
-            text_ops.append("ET")
-
-            stream_data = "\n".join(text_ops)
-            stream_len = len(stream_data)
-
-            pdf_objects.append(
-                f"{page_obj_num} 0 obj\n<< /Type /Page /Parent 2 0 R "
-                f"/MediaBox [0 0 612 792] /Contents {stream_obj_num} 0 R "
-                f"/Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> >> >>\nendobj"
-            )
-            pdf_objects.append(
-                f"{stream_obj_num} 0 obj\n<< /Length {stream_len} >>\nstream\n{stream_data}\nendstream\nendobj"
-            )
-
-        os.makedirs(os.path.dirname(os.path.abspath(pdf_file)), exist_ok=True)
-        with open(pdf_file, "wb") as f:
-            f.write(b"%PDF-1.4\n")
-            offsets = []
-            for obj in pdf_objects:
-                offsets.append(f.tell())
-                f.write(obj.encode("utf-8") + b"\n")
-
-            xref_offset = f.tell()
-            f.write(b"xref\n")
-            f.write(f"0 {len(pdf_objects) + 1}\n".encode("utf-8"))
-            f.write(b"0000000000 65535 f \n")
-            for off in offsets:
-                f.write(f"{off:010d} 00000 n \n".encode("utf-8"))
-
-            f.write(b"trailer\n")
-            f.write(f"<< /Size {len(pdf_objects) + 1} /Root 1 0 R >>\n".encode("utf-8"))
-            f.write(b"startxref\n")
-            f.write(f"{xref_offset}\n".encode("utf-8"))
-            f.write(b"%%EOF\n")
-
-        print(f"[Assembler] Exported PDF report: {pdf_file}")
-        return pdf_file
-
-    def _format_ascii_table(self, rows_text: List[str]) -> List[str]:
-        """Formats markdown table rows into clean, aligned ASCII text table."""
-        t_data = parse_markdown_table(rows_text)
-        all_rows = t_data["all_rows"]
-        if not all_rows:
-            return []
-        num_cols = t_data["num_cols"]
-        alignments = t_data["alignments"]
-
-        # Calculate max widths
-        max_widths = [max(len(r[c]) for r in all_rows) for c in range(num_cols)]
-        total = sum(max_widths) + 3 * num_cols
-        scale = min(1.0, 72.0 / max(1, total))
-        col_widths = [max(8, int(w * scale)) for w in max_widths]
-
-        sep = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
-        header_sep = "+" + "+".join("=" * (w + 2) for w in col_widths) + "+"
-        lines = [sep]
-
-        for r_idx, row in enumerate(all_rows):
-            cells_formatted = []
-            for c_idx, val in enumerate(row):
-                w = col_widths[c_idx]
-                v = val[:w]
-                align = alignments[c_idx] if c_idx < len(alignments) else "left"
-                if align == "right":
-                    cells_formatted.append(f" {v:>{w}} ")
-                else:
-                    cells_formatted.append(f" {v:<{w}} ")
-            lines.append("|" + "|".join(cells_formatted) + "|")
-            if r_idx == 0:
-                lines.append(header_sep)
-            else:
-                lines.append(sep)
-        return lines
-
-    def _md_to_html_entities(self, text: str) -> str:
-        """Converts Markdown inline formatting to ReportLab XML tags safely."""
-        t = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        # Bold **text** -> <b>text</b>
-        t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
-        # Italic *text* -> <i>text</i>
-        t = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", t)
-        return t
-
-    def _add_formatted_runs(self, paragraph, text: str):
-        """Parses bold formatting in docx text."""
-        self._add_formatted_runs_with_style(paragraph, text)
-
-    def _add_formatted_runs_with_style(self, paragraph, text: str, font_size=None, color=None, force_bold=False):
-        """Parses bold and italic formatting in docx text with custom style options."""
-        parts = re.split(r"(\*\*.*?\*\*|\*.*?\*)", text)
-        for part in parts:
-            if not part:
-                continue
-            is_bold = force_bold
-            is_italic = False
-            run_text = part
-
-            if part.startswith("**") and part.endswith("**") and len(part) >= 4:
-                run_text = part[2:-2]
-                is_bold = True
-            elif part.startswith("*") and part.endswith("*") and len(part) >= 2:
-                run_text = part[1:-1]
-                is_italic = True
-
-            run = paragraph.add_run(run_text)
-            if is_bold:
-                run.bold = True
-            if is_italic:
-                run.italic = True
-            if font_size:
-                run.font.size = font_size
-            if color:
-                run.font.color.rgb = color
-
-    def _render_docx_table(self, doc: Document, rows_text: list):
-        """Converts markdown table rows into a styled docx table."""
-        t_data = parse_markdown_table(rows_text)
-        all_rows = t_data["all_rows"]
-        if not all_rows:
-            return
-
-        num_cols = t_data["num_cols"]
-        alignments = t_data["alignments"]
-
-        table = doc.add_table(rows=len(all_rows), cols=num_cols)
+    @staticmethod
+    def _docx_table(doc, rows, aligns, parse_xml, nsdecls, Inches, Pt, RGBColor, WD_TABLE_ALIGNMENT, add_runs):
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        n = len(rows[0])
+        table = doc.add_table(rows=len(rows), cols=n)
+        table.style = "Table Grid"
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        table.style = 'Table Grid'
-        table.autofit = False
-
-        total_width_inches = 6.5
-        col_weights = []
-        for c_idx in range(num_cols):
-            max_len = max(len(row[c_idx]) for row in all_rows)
-            col_weights.append(max(10, min(max_len, 40)))
-        sum_weights = sum(col_weights) or 1
-        col_widths = [Inches((w / sum_weights) * total_width_inches) for w in col_weights]
-
-        # Repeat header on page break
-        header_tr = table.rows[0]._tr.get_or_add_trPr()
-        header_tr.append(parse_xml(r'<w:tblHeader %s/>' % nsdecls('w')))
-
-        for row_idx, row_cells in enumerate(all_rows):
-            row = table.rows[row_idx]
-            # Prevent row breaking across page breaks
-            trPr = row._tr.get_or_add_trPr()
-            trPr.append(parse_xml(r'<w:cantSplit %s/>' % nsdecls('w')))
-
-            is_header = (row_idx == 0)
-            is_total = not is_header and any("total" in c.lower() for c in row_cells)
-            is_even = (row_idx % 2 == 0)
-
-            for col_idx, cell_value in enumerate(row_cells):
-                cell = row.cells[col_idx]
-                cell.width = col_widths[col_idx]
-
-                # Padding: 120 dxa (6pt) top/bottom, 160 dxa (8pt) left/right
-                tcPr = cell._tc.get_or_add_tcPr()
-                tcMar = parse_xml(
-                    r'<w:tcMar %s>'
-                    r'<w:top w:w="120" w:type="dxa"/>'
-                    r'<w:bottom w:w="120" w:type="dxa"/>'
-                    r'<w:left w:w="160" w:type="dxa"/>'
-                    r'<w:right w:w="160" w:type="dxa"/>'
-                    r'</w:tcMar>' % nsdecls('w')
-                )
-                tcPr.append(tcMar)
-
-                # Shading
-                if is_header:
-                    fill_color = "1A365D"  # Navy
-                elif is_total:
-                    fill_color = "EDF2F7"  # Distinct total row
-                elif not is_even:
-                    fill_color = "F8FAFC"  # Light zebra
+        weights = [max(8, min(40, max(len(r[c]) for r in rows))) for c in range(n)]
+        total = sum(weights)
+        widths = [Inches(6.5 * w / total) for w in weights]
+        for ri, row in enumerate(rows):
+            tr = table.rows[ri]._tr.get_or_add_trPr()
+            tr.append(parse_xml(r'<w:cantSplit %s/>' % nsdecls("w")))
+            if ri == 0:
+                tr.append(parse_xml(r'<w:tblHeader %s/>' % nsdecls("w")))
+            for ci, val in enumerate(row):
+                cell = table.rows[ri].cells[ci]
+                cell.width = widths[ci]
+                fill = "1A365D" if ri == 0 else ("F4F6F9" if ri % 2 == 0 else "FFFFFF")
+                cell._tc.get_or_add_tcPr().append(parse_xml(r'<w:shd %s w:fill="%s"/>' % (nsdecls("w"), fill)))
+                par = cell.paragraphs[0]
+                par.paragraph_format.space_after = Pt(2)
+                if aligns[ci] == "right":
+                    par.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                elif aligns[ci] == "center":
+                    par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                if ri == 0:
+                    add_runs(par, val.replace("**", ""), size=Pt(9), color=RGBColor(255, 255, 255), force_bold=True)
                 else:
-                    fill_color = "FFFFFF"
+                    add_runs(par, val, size=Pt(9))
+        doc.add_paragraph().paragraph_format.space_after = Pt(4)
 
-                shd = parse_xml(r'<w:shd %s w:fill="%s"/>' % (nsdecls('w'), fill_color))
-                tcPr.append(shd)
+    # --------------------------------------------------------------------- PDF
+    def export_pdf(self, markdown_file: str, pdf_file: str, title: str) -> str:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+                                        ListFlowable, ListItem)
+        from reportlab.platypus.tableofcontents import TableOfContents
 
-                p = cell.paragraphs[0]
-                p.paragraph_format.space_before = Pt(3)
-                p.paragraph_format.space_after = Pt(3)
+        with open(markdown_file, "r", encoding="utf-8") as f:
+            blocks = _replace_toc_with_marker(parse_markdown_blocks(f.read()))
 
-                align = alignments[col_idx] if col_idx < len(alignments) else "left"
-                if is_header:
-                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if align == "right" else WD_ALIGN_PARAGRAPH.LEFT
-                elif align == "right":
-                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                elif align == "center":
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        regular, bold, italic, unicode_ok = self._register_fonts()
+
+        def clean(t: str) -> str:
+            if not unicode_ok:
+                t = t.replace("\u20b9", "Rs.")
+                t = t.encode("cp1252", errors="replace").decode("cp1252")
+            return t
+
+        def inline(t: str) -> str:
+            out = []
+            for txt, b, it in _inline_runs(clean(re.sub(r"<[^>]+>", "", t))):
+                esc = txt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                if b:
+                    esc = f"<b>{esc}</b>"
+                if it:
+                    esc = f"<i>{esc}</i>"
+                out.append(esc)
+            return "".join(out)
+
+        navy = colors.HexColor("#1A365D")
+        S = {
+            "title": ParagraphStyle("RTitle", fontName=bold, fontSize=26, leading=32, alignment=TA_CENTER, textColor=navy, spaceBefore=140, spaceAfter=24),
+            "cover": ParagraphStyle("RCover", fontName=regular, fontSize=11, leading=16, alignment=TA_CENTER),
+            "h2": ParagraphStyle("RH2", fontName=bold, fontSize=20, leading=24, textColor=navy, spaceAfter=14),
+            "h3": ParagraphStyle("RH3", fontName=bold, fontSize=14, leading=18, textColor=navy, spaceBefore=12, spaceAfter=6),
+            "h4": ParagraphStyle("RH4", fontName=bold, fontSize=11.5, leading=15, textColor=navy, spaceBefore=8, spaceAfter=4),
+            "toctitle": ParagraphStyle("RTocTitle", fontName=bold, fontSize=16, leading=20, textColor=navy, spaceAfter=10),
+            "h5": ParagraphStyle("RH5", fontName=bold, fontSize=10.5, leading=14, spaceBefore=6, spaceAfter=3),
+            "p": ParagraphStyle("RP", fontName=regular, fontSize=9.8, leading=13.6, spaceAfter=6),
+            "quote": ParagraphStyle("RQ", fontName=italic, fontSize=9.8, leading=13.6, leftIndent=14, spaceAfter=6),
+            "cell": ParagraphStyle("RC", fontName=regular, fontSize=8, leading=10),
+            "cellh": ParagraphStyle("RCH", fontName=bold, fontSize=8, leading=10, textColor=colors.white),
+            "cellr": ParagraphStyle("RCR", fontName=regular, fontSize=8, leading=10, alignment=TA_RIGHT),
+        }
+
+        class _Doc(SimpleDocTemplate):
+            def beforeDocument(self):
+                self._toc_n = 0                    # keys must be identical on every pass or the TOC never settles
+
+            def afterFlowable(self, fl):
+                if isinstance(fl, Paragraph):
+                    name = fl.style.name
+                    lvl = {"RH2": 0, "RH3": 1}.get(name)      # chapters + sections keep the TOC readable
+                    if lvl is not None:
+                        self._toc_n = getattr(self, "_toc_n", 0) + 1
+                        key = f"toc{self._toc_n}"
+                        self.canv.bookmarkPage(key)
+                        self.notify("TOCEntry", (lvl, fl.getPlainText(), self.page, key))
+
+        def footer(canv, d):
+            if d.page > 1:
+                canv.saveState()
+                canv.setFont(regular, 8)
+                canv.setFillColor(colors.grey)
+                canv.drawString(2 * cm, 1.2 * cm, clean(title)[:90])
+                canv.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {d.page}")
+                canv.restoreState()
+
+        toc = TableOfContents()
+        toc.levelStyles = [
+            ParagraphStyle("TOC0", fontName=bold, fontSize=10.5, leading=15, leftIndent=0, spaceBefore=4),
+            ParagraphStyle("TOC1", fontName=regular, fontSize=9.5, leading=13, leftIndent=14),
+            ParagraphStyle("TOC2", fontName=regular, fontSize=8.5, leading=12, leftIndent=28),
+        ]
+        avail = A4[0] - 4 * cm
+        story: List[Any] = []
+        in_cover = True
+        for b in blocks:
+            kind = b[0]
+            if kind == "h":
+                lvl, text = b[1], b[2]
+                if lvl == 1:
+                    story.append(Paragraph(inline(text), S["title"]))
+                elif lvl == 2:
+                    story.append(PageBreak())
+                    story.append(Paragraph(inline(text), S["h2"]))
+                    in_cover = False
                 else:
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    story.append(Paragraph(inline(text), S[{3: "h3", 4: "h4"}.get(lvl, "h5")]))
+            elif kind == "toc":
+                in_cover = False
+                story.append(PageBreak())
+                story.append(Paragraph("Table of Contents", S["toctitle"]))
+                story.append(toc)
+            elif kind == "p":
+                story.append(Paragraph(inline(b[1]), S["cover"] if in_cover else S["p"]))
+            elif kind in ("ul", "ol"):
+                items = [ListItem(Paragraph(inline(i), S["p"]), leftIndent=12) for i in b[1]]
+                story.append(ListFlowable(items, bulletType="bullet" if kind == "ul" else "1", start="\u2022" if kind == "ul" else 1,
+                                          leftIndent=14, bulletFontName=regular))
+            elif kind == "quote":
+                story.append(Paragraph(inline(b[1]), S["quote"]))
+            elif kind == "table":
+                rows, aligns = b[1], b[2]
+                n = len(rows[0])
+                weights = [max(6, min(40, max(len(r[c]) for r in rows))) for c in range(n)]
+                tot = sum(weights)
+                widths = [avail * w / tot for w in weights]
+                data = []
+                for ri, row in enumerate(rows):
+                    data.append([Paragraph(inline(c.replace("**", "") if ri == 0 else c),
+                                           S["cellh"] if ri == 0 else (S["cellr"] if aligns[ci] == "right" else S["cell"]))
+                                 for ci, c in enumerate(row)])
+                t = Table(data, colWidths=widths, repeatRows=1)
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), navy),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F6F9")]),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C5CCD6")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ]))
+                story.append(t)
+                story.append(Spacer(1, 8))
 
-                clean_val = cell_value.strip()
-                if is_header:
-                    run = p.add_run(clean_val.replace("**", ""))
-                    run.bold = True
-                    run.font.size = Pt(9.5)
-                    run.font.color.rgb = RGBColor(255, 255, 255)
-                else:
-                    self._add_formatted_runs_with_style(
-                        p, clean_val,
-                        font_size=Pt(9),
-                        color=RGBColor(45, 55, 72),
-                        force_bold=is_total
-                    )
+        os.makedirs(os.path.dirname(os.path.abspath(pdf_file)), exist_ok=True)
+        doc = _Doc(pdf_file, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=2 * cm,
+                   bottomMargin=2 * cm, title=clean(title))
+        doc.multiBuild(story, onFirstPage=footer, onLaterPages=footer)
+        print(f"[Assembler] PDF written: {pdf_file}")
+        return pdf_file
 
-        doc.add_paragraph().paragraph_format.space_after = Pt(8)
+    @staticmethod
+    def _register_fonts() -> Tuple[str, str, str, bool]:
+        """Register a Unicode TTF family if one is installed (needed for symbols such as the rupee sign)."""
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        candidates = [
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf"),
+            ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/segoeuii.ttf"),
+            ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/ariali.ttf"),
+            ("/Library/Fonts/Arial Unicode.ttf", "/Library/Fonts/Arial Unicode.ttf", "/Library/Fonts/Arial Unicode.ttf"),
+        ]
+        for reg, bld, ita in candidates:
+            if all(os.path.exists(p) for p in (reg, bld, ita)):
+                try:
+                    pdfmetrics.registerFont(TTFont("RptRegular", reg))
+                    pdfmetrics.registerFont(TTFont("RptBold", bld))
+                    pdfmetrics.registerFont(TTFont("RptItalic", ita))
+                    pdfmetrics.registerFontFamily("RptRegular", normal="RptRegular", bold="RptBold",
+                                                  italic="RptItalic", boldItalic="RptBold")
+                    return "RptRegular", "RptBold", "RptItalic", True
+                except Exception:
+                    continue
+        return "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", False

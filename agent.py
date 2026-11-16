@@ -1,464 +1,315 @@
-"""Generic Task Execution Agent (v2).
+"""Generic task-execution agent: ONE class that writes any section of any company's report.
 
-ONE agent class, used for every section of every company. It:
-  1. seeds research with the planner's search queries,
-  2. then DECIDES by itself (small ReAct-style loop) whether to search more / open a page / start writing,
-  3. writes the section ONLY from gathered evidence + earlier sections,
-  4. says "not disclosed in sources reviewed" when data is missing - it never invents numbers.
+For each writing task it
+  1. retrieves the most relevant pages of the company's real report from the knowledge base,
+  2. goes to the web only to fill gaps (thin retrieval, or when a reviewer asked for a fix),
+  3. writes the section strictly from that evidence, within its scope boundaries, aware of what other
+     sections already cover (no repetition), and to the length the plan budgeted,
+  4. says "Not disclosed in the sources reviewed" for anything the evidence does not contain.
 
-There is no hardcoded per-section fallback text any more (the old _generate_fallback_content
-produced the same fake TCS-style numbers for every company).
+On failure it returns a FAILED output with an honest placeholder. It never fabricates text.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import re
+import threading
 import uuid
-from typing import Dict, Any, List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-from config import settings, get_llm
-from schemas import (
-    TaskDefinition,
-    TaskOutput,
-    TaskStatus,
-    CompanyProfile,
-    EvidenceItem,
-)
+from config import get_llm, settings
+from knowledge import KnowledgeBase
+from schemas import (EvidenceItem, ReportBlueprint, SourceDocument, TaskDefinition, TaskOutput, TaskStatus)
+from skills import get_style_guidance
 from tools import ResearchTools
-from skills import get_skill_guidance
-from assembler import extract_structured_tables
-import json
+from utils import clean_llm_text, digest, word_count
 
-MAX_AGENT_STEPS = settings.MAX_RESEARCH_STEPS
-MAX_EVIDENCE_CHARS = settings.MAX_EVIDENCE_CHARS
-NOT_DISCLOSED = "Not disclosed in the public sources reviewed"
+NOT_DISCLOSED = "Not disclosed in the sources reviewed"
 
 
-def _clean_llm_text(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
-    return re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", text.strip())
+@dataclass
+class RunContext:
+    """Shared, thread-safe state for one report run."""
+    blueprint: ReportBlueprint
+    kb: KnowledgeBase
+    tools: ResearchTools
+    draft_dir: str
+    texts: Dict[str, str] = field(default_factory=dict)
+    digests: Dict[str, str] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self):
+        os.makedirs(self.draft_dir, exist_ok=True)
+        self.chapter_tasks: Dict[str, List[TaskDefinition]] = {}
+        for t in self.blueprint.tasks:
+            self.chapter_tasks.setdefault(t.chapter_id, []).append(t)
+        self.chapter_titles = [c.title for c in self.blueprint.chapters]
+        docs = self.blueprint.reference_documents
+        self.docs_note = "\n".join(
+            f"- {d.title}: period {d.fiscal_year or 'unknown'}"
+            f"{'' if d.matches_requested_period else ' (MAY NOT BE the requested period)'}"
+            for d in docs) or "- none found (only web snippets are available)"
+
+    def record(self, task_id: str, text: str) -> None:
+        with self.lock:
+            self.texts[task_id] = text
+            self.digests[task_id] = digest(text, 420)
+
+    def snapshot_texts(self) -> Dict[str, str]:
+        with self.lock:
+            return dict(self.texts)
 
 
 class GenericTaskExecutionAgent:
-    """Single reusable agent: research -> decide -> write, for any section of any report."""
-
-    def __init__(self, agent_id: Optional[str] = None, tools: Optional[ResearchTools] = None):
+    def __init__(self, ctx: RunContext, agent_id: Optional[str] = None):
+        self.ctx = ctx
         self.agent_id = agent_id or f"agent_{uuid.uuid4().hex[:6]}"
-        self.tools = tools or ResearchTools()
         self.llm = get_llm()
-        self.drafts_dir = os.path.join(self.tools.run_dir, "drafts")
-        os.makedirs(self.drafts_dir, exist_ok=True)
+        self.from_cache = False
 
     # ------------------------------------------------------------------ main
-    def execute_task(
-        self,
-        task: TaskDefinition,
-        prior_context: Optional[Dict[str, Any]] = None,
-        company_profile: Optional[CompanyProfile] = None,
-        feedback: Optional[str] = None,
-    ) -> TaskOutput:
-        draft_file = os.path.join(self.drafts_dir, f"{task.task_id}.md")
+    def execute_task(self, task: TaskDefinition, feedback: Optional[str] = None) -> TaskOutput:
+        self.from_cache = False
+        md_path = os.path.join(self.ctx.draft_dir, f"{task.task_id}.md")
+        meta_path = os.path.join(self.ctx.draft_dir, f"{task.task_id}.json")
 
-        # resume support
-        if not feedback and os.path.exists(draft_file):
-            with open(draft_file, "r", encoding="utf-8") as f:
+        if not feedback and os.path.exists(md_path):                      # resume support
+            with open(md_path, "r", encoding="utf-8") as f:
                 cached = f.read().strip()
-            if len(cached.split()) > 60:
-                print(f"[{self.agent_id}] Resuming '{task.title}' from cached draft.")
-                return TaskOutput(task_id=task.task_id, chapter_id=task.chapter_id, markdown_content=cached)
+            if word_count(cached) > 30:
+                sources: List[str] = []
+                if os.path.exists(meta_path):
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        sources = json.load(f).get("sources", [])
+                self.ctx.record(task.task_id, cached)
+                self.from_cache = True
+                return TaskOutput(task_id=task.task_id, chapter_id=task.chapter_id, markdown_content=cached,
+                                  sources=sources, word_count=word_count(cached))
 
-        print(f"\n[{self.agent_id}] Task: '{task.title}' ({task.task_id})")
-        evidence: List[EvidenceItem] = []
-
-        # 1. seed research with planner queries (bounded)
-        for q in task.search_queries[:2]:
-            self._search(q, task, evidence)
-
-        # 2. agentic loop: bounded to maintain prompt and latency limits
-        for step in range(min(2, MAX_AGENT_STEPS)):
-            action = self._decide_next_action(task, company_profile, evidence, feedback)
-            kind = action.get("action")
-            if kind == "search" and action.get("query"):
-                print(f"[{self.agent_id}]   step {step+1}: search -> {action['query']}")
-                self._search(action["query"], task, evidence)
-            elif kind == "scrape" and action.get("url"):
-                print(f"[{self.agent_id}]   step {step+1}: open -> {action['url']}")
-                self._scrape(action["url"], task, evidence)
-            else:
-                break  # agent says "write"
-
-        # 3. write strictly from evidence
+        print(f"[{self.agent_id}] Writing '{' > '.join(task.path)}' (~{task.target_words} words)")
         try:
-            markdown = self._write_section(task, company_profile, evidence, prior_context, feedback)
-            status, err = TaskStatus.COMPLETED, None
+            evidence = self._retrieve(task)
+            if feedback or len(evidence) < settings.MIN_KB_HITS_BEFORE_WEB:
+                evidence += self._web_evidence(task, start=len(evidence) + 1)
+            self.ctx.tools.save_evidence(evidence)
+
+            text = self._write(task, evidence, feedback)
+            if (settings.EXPAND_PASSES > 0 and word_count(text) < 0.6 * task.target_words
+                    and sum(len(e.text) for e in evidence) > 6000):
+                for _ in range(settings.EXPAND_PASSES):
+                    text = self._expand(task, text, evidence)
+            body, sources = self._finalize(task, text, evidence)
         except Exception as e:
-            print(f"[{self.agent_id}] Note: LLM section drafting unavailable ({e}); generating resilient statutory section.")
-            markdown = self._generate_fallback_section(task, company_profile, evidence)
-            status, err = TaskStatus.COMPLETED, None
+            print(f"[{self.agent_id}] FAILED '{task.title}': {e}")
+            return TaskOutput(task_id=task.task_id, chapter_id=task.chapter_id, status=TaskStatus.FAILED,
+                              markdown_content=f"*(This section could not be generated: {str(e)[:160]})*",
+                              error_message=str(e))
 
-        if status == TaskStatus.COMPLETED:
-            with open(draft_file, "w", encoding="utf-8") as f:
-                f.write(markdown)
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(body)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"sources": sources}, f)
+        self.ctx.record(task.task_id, body)
+        print(f"[{self.agent_id}] Done '{task.title}': {word_count(body)} words (target {task.target_words}), "
+              f"{len(evidence)} evidence items")
+        return TaskOutput(task_id=task.task_id, chapter_id=task.chapter_id, markdown_content=body,
+                          evidence_used=evidence, sources=sources, word_count=word_count(body))
 
-        # Extract structured tables for programmatic use
-        tables = extract_structured_tables(markdown)
+    # ------------------------------------------------------------- research
+    def _retrieve(self, task: TaskDefinition) -> List[EvidenceItem]:
+        k = settings.RETRIEVAL_TOP_K * (2 if task.kind in ("financial_statement", "data_table") else 1)
+        queries = [f"{task.title} {task.what_to_cover}"[:300]] + list(task.search_queries)
+        best: Dict[int, Tuple[object, float]] = {}
+        for q in queries:
+            for ch, sc in self.ctx.kb.search(q, k=k):
+                if ch.chunk_id not in best or sc > best[ch.chunk_id][1]:
+                    best[ch.chunk_id] = (ch, sc)
+        top = sorted(best.values(), key=lambda x: -x[1])[:k]
+        top.sort(key=lambda x: (x[0].doc_id, x[0].page or 0))               # reading order
+        out = []
+        for i, (ch, sc) in enumerate(top, 1):
+            out.append(EvidenceItem(evidence_id=f"ev_{uuid.uuid4().hex[:8]}", task_id=task.task_id,
+                                    text=ch.text, source_title=ch.doc_title, source_url=ch.url,
+                                    page=ch.page, origin="knowledge_base", score=round(sc, 3)))
+        return out
 
-        print(f"[{self.agent_id}] Done '{task.title}' ({len(markdown.split())} words, {len(evidence)} evidence items, {len(tables)} tables)")
-        return TaskOutput(
-            task_id=task.task_id,
-            chapter_id=task.chapter_id,
-            markdown_content=markdown,
-            structured_tables=tables,
-            evidence_used=evidence,
-            status=status,
-            error_message=err,
-        )
+    def _web_evidence(self, task: TaskDefinition, start: int) -> List[EvidenceItem]:
+        items: List[EvidenceItem] = []
+        seen: List[str] = []
+        for q in task.search_queries[:2]:
+            for r in self.ctx.tools.web_search(q, max_results=settings.MAX_SEARCH_RESULTS):
+                if r["href"] in seen:
+                    continue
+                seen.append(r["href"])
+                if r.get("body"):
+                    items.append(EvidenceItem(evidence_id=f"ev_{uuid.uuid4().hex[:8]}", task_id=task.task_id,
+                                              text=r["body"], source_title=r.get("title", ""),
+                                              source_url=r["href"], origin="web"))
+        for url in seen[:2]:
+            page_text = self.ctx.tools.scrape_url(url, max_chars=4000)
+            if word_count(page_text) > 80:
+                items.append(EvidenceItem(evidence_id=f"ev_{uuid.uuid4().hex[:8]}", task_id=task.task_id,
+                                          text=page_text, source_title="(web page)", source_url=url, origin="web"))
+        return items
 
-    # --------------------------------------------------------------- research
-    def _add_evidence(self, evidence: List[EvidenceItem], task: TaskDefinition,
-                      url: str, title: str, text: str, conf: float):
-        if not text or any(e.source_url == url and e.fact_or_data[:80] == text[:80] for e in evidence):
-            return
-        item = EvidenceItem(
-            evidence_id=f"ev_{uuid.uuid4().hex[:8]}", task_id=task.task_id,
-            fact_or_data=text, source_url=url, source_title=title, confidence=conf,
-        )
-        evidence.append(item)
-        self.tools.save_evidence(item)
+    # -------------------------------------------------------------- writing
+    @staticmethod
+    def _label(e: EvidenceItem) -> str:
+        if e.origin == "knowledge_base":
+            return f"{e.source_title}, p.{e.page}" if e.page else e.source_title
+        return f"Web: {e.source_title or ''} {e.source_url}".strip()
 
-    def _search(self, query: str, task: TaskDefinition, evidence: List[EvidenceItem]):
-        for r in self.tools.web_search(query, max_results=settings.MAX_SEARCH_RESULTS):
-            self._add_evidence(evidence, task, r.get("href", ""), r.get("title", ""), r.get("body", ""), 0.6)
-
-    def _scrape(self, url: str, task: TaskDefinition, evidence: List[EvidenceItem]):
-        known = {e.source_url for e in evidence}
-        if url not in known:      # only open pages the agent has actually seen in results
-            return
-        text = self.tools.scrape_url(url, max_chars=4000)
-        title = next((e.source_title for e in evidence if e.source_url == url), "")
-        self._add_evidence(evidence, task, url, title, text, 0.85)
-
-    def _decide_next_action(self, task, profile, evidence, feedback) -> Dict[str, Any]:
-        digest = "\n".join(
-            f"[{i+1}] {e.source_title} | {e.source_url} | {e.fact_or_data[:160]}"
-            for i, e in enumerate(evidence[-14:], start=max(0, len(evidence) - 14))
-        ) or "(nothing gathered yet)"
-        system = ("You are a research planner for an annual-report writer. Decide the single next action. "
-                  "Return ONLY JSON: {\"action\": \"search\"|\"scrape\"|\"write\", \"query\": str, \"url\": str, \"reason\": str}. "
-                  "Choose 'write' once the evidence is enough to cover the required content, or if more searching "
-                  "is unlikely to help. 'scrape' may only use a URL listed below.")
-        user = (f"Company: {profile.company_name if profile else ''}\n"
-                f"Section: {task.title}\nMust cover: {task.execution_instructions}\n"
-                f"Criteria: {task.validation_criteria}\n"
-                f"Reviewer feedback: {feedback or 'none'}\n\n"
-                f"Evidence so far:\n{digest}\n\nNext action?")
-        try:
-            resp = self.llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user}])
-            raw = _clean_llm_text(resp.content)
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            return json.loads(m.group(0)) if m else {"action": "write"}
-        except Exception:
-            return {"action": "write"}
-
-    # ---------------------------------------------------------------- writing
-    def _write_section(self, task, profile, evidence, prior_context, feedback) -> str:
-        # evidence block with numbered citations
+    def _evidence_block(self, evidence: List[EvidenceItem]) -> str:
         blocks, used = [], 0
         for i, e in enumerate(evidence, 1):
-            b = f"[{i}] {e.source_title} ({e.source_url})\n{e.fact_or_data[:1800]}"
-            if used + len(b) > MAX_EVIDENCE_CHARS:
+            b = f"[E{i}] ({self._label(e)})\n{e.text}"
+            if used + len(b) > settings.MAX_EVIDENCE_CHARS:
                 break
             blocks.append(b)
             used += len(b)
-        evidence_text = "\n\n".join(blocks) or "(no web evidence found)"
+        return "\n\n".join(blocks) or "(no evidence found)"
 
-        prior = ""
-        if prior_context:
-            for dep in task.dependencies:
-                if dep in prior_context:
-                    prior += f"\n--- Earlier section [{dep}] ---\n{str(prior_context[dep])[:1500]}\n"
+    def _scope_block(self, task: TaskDefinition) -> str:
+        ctx = self.ctx
+        sib = [t for t in ctx.chapter_tasks.get(task.chapter_id, []) if t.task_id != task.task_id]
+        lines, used = [], 0
+        for t in sib:
+            ln = f"- {' > '.join(t.path[1:]) or t.title}: {t.what_to_cover[:110]}"
+            if used + len(ln) > 4500:
+                lines.append("- ...")
+                break
+            lines.append(ln)
+            used += len(ln)
+        others = ", ".join(c for c in ctx.chapter_titles if c != task.path[0])
+        with ctx.lock:
+            done = [(t.title, ctx.digests[t.task_id]) for t in sib if t.task_id in ctx.digests]
+        covered, used = [], 0
+        for title, dg in done:
+            ln = f"- {title}: {dg}"
+            if used + len(ln) > 3000:
+                break
+            covered.append(ln)
+            used += len(ln)
+        return (f"OTHER PARTS OF THIS CHAPTER (they own their own content - do not write it here):\n"
+                f"{chr(10).join(lines) or '(none)'}\n\nOTHER CHAPTERS: {others or '(none)'}\n\n"
+                f"ALREADY WRITTEN IN THIS CHAPTER (do not repeat; refer to it in a clause if needed):\n"
+                f"{chr(10).join(covered) or '(nothing yet)'}")
 
-        skills_text = get_skill_guidance(task.skills_required)
-        company = profile.company_name if profile else "the Company"
+    def _dependency_block(self, task: TaskDefinition) -> str:
+        ctx = self.ctx
+        with ctx.lock:
+            have = [d for d in task.dependencies if d in ctx.texts]
+            if not have:
+                return "(none)"
+            if len(have) <= 8:
+                return "\n".join(f"--- {ctx.blueprint.get_task(d).title} ---\n{ctx.texts[d][:1500]}" for d in have)
+            out, used = [], 0
+            for d in have:
+                ln = f"- {ctx.blueprint.get_task(d).title}: {ctx.digests[d]}"
+                if used + len(ln) > 9000:
+                    break
+                out.append(ln)
+                used += len(ln)
+            return "\n".join(out)
 
-        system = (
-            f"You are the senior report writer of {company}'s annual report, writing one section in the formal "
-            f"voice of a published annual report (as the jurisdiction/industry normally words it).\n"
-            f"STRICT TRUTHFULNESS RULES:\n"
-            f"1. Use ONLY facts found in the EVIDENCE or EARLIER SECTIONS. Never invent numbers, names, dates, "
-            f"percentages, quotes or tables.\n"
-            f"2. If a required item is missing from the evidence, state: \"{NOT_DISCLOSED}\" for that item and move on. "
-            f"Do not fill the gap with plausible-looking figures.\n"
-            f"3. Cite evidence inline as [n]. Include currency, unit and period for every figure.\n"
-            f"4. When the task, skills, or validation criteria call for a table or comparison matrix (e.g. key metrics, financial indicators, peer comparisons, board committees, risk registers), ALWAYS include a structured Markdown table with '| Header 1 | Header 2 |' and '| --- | --- |'. Use evidence data; if specific metrics are not disclosed, write '{NOT_DISCLOSED}' or 'N/A' rather than omitting the table. Ensure every table row has the same number of columns as the header.\n"
-            f"5. Length follows the evidence: be thorough where data exists, short where it does not. No padding.\n"
-            f"6. Output ONLY Markdown, starting with a '### ' heading. No preamble or commentary."
+    def _system_prompt(self, task: TaskDefinition) -> str:
+        p = self.ctx.blueprint.company_profile
+        return (
+            f"You are the senior report writer for the annual report of {p.company_name}. You write ONE part of it in the "
+            f"formal voice of a published annual report, as this company's jurisdiction normally words it.\n"
+            f"TRUTHFULNESS RULES (non-negotiable):\n"
+            f"1. Use ONLY facts in the EVIDENCE or the EARLIER-SECTION CONTEXT. Never invent numbers, names, dates, "
+            f"percentages, quotes, targets or tables.\n"
+            f"2. If a required item is not in the evidence write \"{NOT_DISCLOSED}\" for that item and move on. Never fill "
+            f"gaps with plausible-looking content.\n"
+            f"3. Cite evidence inline as [E1], [E2]. Every figure carries its currency, unit and period. If evidence "
+            f"comes from a different fiscal year than {self.ctx.blueprint.input_spec.financial_year}, say which year it is; "
+            f"never present another year's figure as the requested year's.\n"
+            f"4. Tables: Markdown with a header row and '| --- |' separator; every row has the same number of columns.\n"
+            f"5. Stay inside this part's scope. Do not write what belongs to other parts; do not repeat what earlier "
+            f"parts already say.\n"
+            f"6. Length: aim for about {task.target_words} words where the evidence supports it. Be thorough where there "
+            f"is data; never pad with generic filler or boilerplate to reach a length.\n"
+            f"7. Output ONLY the Markdown body. Do NOT start with the part's own title (it is added automatically). "
+            f"Use '####' sub-headings if useful. No preamble, no commentary.\n"
+            f"STYLE FOR THIS KIND OF PART ({task.kind}): {get_style_guidance(task.kind)}"
         )
-        user = f"""SECTION: {task.title}
-PURPOSE: {task.purpose}
-INSTRUCTIONS: {task.execution_instructions}
+
+    def _write(self, task: TaskDefinition, evidence: List[EvidenceItem], feedback: Optional[str]) -> str:
+        spec = self.ctx.blueprint.input_spec
+        user = f"""PART TO WRITE: {' > '.join(task.path)}
+REPORT: {self.ctx.blueprint.company_profile.company_name} - {spec.financial_year} - {spec.reporting_scope}
+WHAT IT MUST COVER: {task.what_to_cover}
 ACCEPTANCE CRITERIA:
 {chr(10).join('- ' + c for c in task.validation_criteria) or '- (none)'}
+TARGET LENGTH: about {task.target_words} words
 
-WRITING GUIDELINES (optional skills):
-{skills_text or '(none)'}
+REFERENCE DOCUMENTS AVAILABLE:
+{self.ctx.docs_note}
+
+{self._scope_block(task)}
+
+EARLIER SECTIONS THIS PART BUILDS ON:
+{self._dependency_block(task)}
 
 EVIDENCE:
-{evidence_text}
+{self._evidence_block(evidence)}
 
-EARLIER SECTIONS THIS ONE BUILDS ON:
-{prior or '(none)'}
-
-{('REVIEWER FEEDBACK TO FIX:' + chr(10) + feedback) if feedback else ''}"""
-
-        resp = self.llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user}])
-        text = _clean_llm_text(resp.content)
-        if len(text.split()) < 15:
-            raise ValueError("LLM returned empty/too short output")
-
-        cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(evidence)})
-        if cited:
-            refs = "; ".join(f"[{n}] {evidence[n-1].source_url}" for n in cited)
-            text += f"\n\n*Sources: {refs}*"
+{('REVIEWER FEEDBACK - FIX THESE ISSUES:' + chr(10) + feedback) if feedback else ''}"""
+        max_tokens = max(1500, min(settings.MAX_OUTPUT_TOKENS, int(task.target_words * 3.2) + 600))
+        resp = self.llm.invoke([{"role": "system", "content": self._system_prompt(task)},
+                                {"role": "user", "content": user}], max_tokens=max_tokens)
+        text = clean_llm_text(resp.content)
+        if word_count(text) < 12:
+            raise ValueError("LLM returned an empty or too-short section")
         return text
 
-    def _generate_fallback_section(
-        self,
-        task: TaskDefinition,
-        profile: Optional[CompanyProfile],
-        evidence: List[EvidenceItem]
-    ) -> str:
-        co = profile.company_name if profile else "The Company"
-        country = profile.country if profile else "India"
-        ind = profile.industry if profile else "Technology & Corporate Services"
-        title_lower = task.title.lower()
-        curr = "₹" if country.lower() == "india" else ("$" if country.lower() in ("us", "usa", "united states") else "€")
-        scale = "Cr" if curr == "₹" else "M"
+    def _expand(self, task: TaskDefinition, draft: str, evidence: List[EvidenceItem]) -> str:
+        user = f"""The draft below for "{' > '.join(task.path)}" is {word_count(draft)} words; the target is about
+{task.target_words}. The evidence contains more usable material than the draft covers.
+Rewrite and extend it: add every relevant fact, figure, table row and explanation from the EVIDENCE that the draft
+omits (keeping within this part's scope). Do not add filler, do not repeat yourself, do not invent anything.
+Keep [E#] citations. Output ONLY the full improved Markdown body.
 
-        citations_text = ""
-        if evidence:
-            valid_urls = [e.source_url for e in evidence if e.source_url]
-            if valid_urls:
-                citations_text = f"\n\n*Sources: {'; '.join(list(dict.fromkeys(valid_urls))[:3])}*"
+DRAFT:
+{draft}
 
-        # 1. Corporate Profile & Identity
-        if any(k in title_lower for k in ["profile", "footprint", "identity", "scale", "overview", "vision"]):
-            return (
-                f"### {task.title}\n\n"
-                f"{co} is an industry-leading corporate enterprise founded and headquartered in {country}. The company delivers "
-                f"high-impact, mission-critical solutions to premier global and domestic clients across diverse industry verticals. "
-                f"With state-of-the-art delivery centers, regional offices, and a global talent footprint, {co} exemplifies "
-                f"operational excellence, robust governance, and long-term client partnerships.\n\n"
-                f"#### Corporate Scale & Operational Footprint\n\n"
-                f"| Strategic Dimension | Corporate Profile Specification | Operational Standard |\n"
-                f"| :--- | :--- | :--- |\n"
-                f"| Registered Corporate Entity | {co} | Listed Public Corporation |\n"
-                f"| Country of Domicile & Lineage | {country} | National Corporate Jurisdiction |\n"
-                f"| Core Industry Classification | {ind} | Global Regulatory Classification |\n"
-                f"| Global Delivery Network | Scaled multi-regional delivery campuses | Zero-Downtime Resilience |\n"
-                f"| Reporting Framework Scope | Audited Consolidated Operations | Statutory Conformance |\n\n"
-                f"The organization's mission centers on delivering sustainable stakeholder value through innovation and continuous execution rigor.{citations_text}"
-            )
+EVIDENCE:
+{self._evidence_block(evidence)}"""
+        try:
+            resp = self.llm.invoke([{"role": "system", "content": self._system_prompt(task)},
+                                    {"role": "user", "content": user}],
+                                   max_tokens=max(1500, min(settings.MAX_OUTPUT_TOKENS, int(task.target_words * 3.2) + 600)))
+            better = clean_llm_text(resp.content)
+            return better if word_count(better) > word_count(draft) else draft
+        except Exception:
+            return draft
 
-        # 2. Executive Leadership & Strategy
-        elif any(k in title_lower for k in ["leadership", "address", "chairman", "ceo", "executive", "strategic review"]):
-            return (
-                f"### {task.title}\n\n"
-                f"During the reporting period, {co} navigated macroeconomic volatility with disciplined execution, "
-                f"deep client engagements, and focused investments in next-generation technology platforms. Strategic growth pillars "
-                f"prioritized client modernization journeys, cloud-native deployments, and operational margin resilience.\n\n"
-                f"#### Executive Strategic Priorities\n\n"
-                f"| Strategic Pillar | Core Management Objective | Execution Milestone |\n"
-                f"| :--- | :--- | :--- |\n"
-                f"| Client Transformation | Deepen strategic large-deal engagements | Multi-year client commitments |\n"
-                f"| Innovation & Platforms | Accelerate Cloud, AI, and digital offerings | Proprietary solution IP deployment |\n"
-                f"| Operational Rigor | Optimize delivery pyramids and supply chains | Resilient operating profit margins |\n"
-                f"| Capital Allocation | Maintain debt-free balance sheet & dividend payouts | Robust shareholder returns |\n\n"
-                f"Leadership remains confident in {co}'s structural positioning to capture emerging enterprise demand across global markets.{citations_text}"
-            )
+    # ------------------------------------------------------------ finishing
+    def _finalize(self, task: TaskDefinition, text: str, evidence: List[EvidenceItem]) -> Tuple[str, List[str]]:
+        lines = text.strip().splitlines()
+        while lines and re.match(r"^#{1,3}\s", lines[0].strip()) and \
+                re.sub(r"^#+\s*\d*[\.\)]?\s*", "", lines[0]).strip().lower() == task.title.strip().lower():
+            lines.pop(0)                                                   # writer repeated the title
+        text = "\n".join(lines).strip()
 
-        # 3. Business Segments & Platforms
-        elif any(k in title_lower for k in ["segment", "platform", "unit", "solution", "practice", "vertical"]):
-            segs = profile.key_business_segments if (profile and profile.key_business_segments) else [
-                "Banking, Financial Services & Insurance (BFSI)",
-                "Consumer Business & Retail",
-                "Manufacturing, Automotive & Energy",
-                "Healthcare & Life Sciences"
-            ]
-            rows = []
-            for idx, s in enumerate(segs[:4], 1):
-                rows.append(f"| {s} | Digital modernization & industry platforms | Tier-1 enterprise clientele | Core Growth Engine {idx} |")
-            seg_rows = "\n".join(rows)
-            return (
-                f"### {task.title}\n\n"
-                f"{co} organizes its business operations into focused industry service verticals and horizontal platform practices, "
-                f"combining deep domain insights with cutting-edge engineering capabilities to deliver measurable transformational value.\n\n"
-                f"#### Business Segment Breakdown & Platform Portfolio\n\n"
-                f"| Business Vertical / Practice | Client Value Proposition | Technology & Innovation Focus | Operational Role |\n"
-                f"| :--- | :--- | :--- | :--- |\n"
-                f"{seg_rows}\n\n"
-                f"Each segment operates with end-to-end accountability, driving high customer satisfaction and repeatable digital solutions.{citations_text}"
-            )
+        cited = set()
+        for m in re.finditer(r"\[((?:E\d+[\s,;]*)+)\]", text):
+            cited.update(int(n) for n in re.findall(r"E(\d+)", m.group(1)))
+        text = re.sub(r"\s*\[(?:E\d+[\s,;]*)+\]", "", text)
 
-        # 4. Macro Trends & Operating Environment
-        elif any(k in title_lower for k in ["macro", "environment", "operating context", "industry trend", "outlook"]):
-            return (
-                f"### {task.title}\n\n"
-                f"The global operating environment for {ind} reflects a structural pivot toward artificial intelligence, "
-                f"cloud optimization, and automated enterprise architectures. Despite inflationary pressures and cautious corporate discretionary spend, "
-                f"investments in cost modernization and operational resilience remain high enterprise priorities.\n\n"
-                f"#### Industry Macro Dynamics & Strategic Tailwinds\n\n"
-                f"| Market Trend / Driver | Enterprise Impact | {co}'s Strategic Response |\n"
-                f"| :--- | :--- | :--- |\n"
-                f"| Generative AI & Automation | Accelerated demand for AI-ready data infrastructure | Enterprise AI suites and skilled talent pools |\n"
-                f"| Hybrid Cloud Consolidation | Focus on vendor consolidation and cloud ROI | End-to-end managed cloud solutions |\n"
-                f"| Cyber Security & Resilience | Stringent data privacy regulations globally | Zero-Trust architecture & SOC monitoring |\n"
-                f"| Cost Optimization | Shift to vendor rationalization & efficiency deals | Competitive delivery scale and automated operations |\n\n"
-                f"{co} is exceptionally positioned to partner with clients across both efficiency programs and strategic transformation initiatives.{citations_text}"
-            )
-
-        # 5. Peer Benchmarking & Matrix
-        elif any(k in title_lower for k in ["peer", "benchmark", "competitor", "competitive"]):
-            peers = profile.peer_competitors if (profile and profile.peer_competitors) else ["Infosys", "Wipro", "Accenture"]
-            p1 = peers[0] if len(peers) > 0 else "Tier-1 Peer Alpha"
-            p2 = peers[1] if len(peers) > 1 else "Tier-1 Peer Beta"
-            p3 = peers[2] if len(peers) > 2 else "Tier-1 Peer Gamma"
-            return (
-                f"### {task.title}\n\n"
-                f"A disciplined benchmarking analysis against leading international and domestic peers confirms {co}'s "
-                f"distinctive competitive positioning, industry-leading client retention, and robust margin profiles.\n\n"
-                f"#### Competitive Peer Comparison Matrix\n\n"
-                f"| Company / Peer Name | Strategic Focus | Scaled Operating Capabilities | Primary Market Positioning |\n"
-                f"| :--- | :--- | :--- | :--- |\n"
-                f"| **{co}** | Full-lifecycle digital transformation & AI | Scaled global delivery network and marquee client accounts | Industry Benchmark |\n"
-                f"| {p1} | Enterprise cloud & consulting solutions | Scaled international presence | Primary Tier-1 Competitor |\n"
-                f"| {p2} | Engineering services & digital integration | Broad regional footprint | Major Enterprise Competitor |\n"
-                f"| {p3} | Global management consulting & technology | Expansive multi-market footprint | Global Enterprise Peer |\n\n"
-                f"The comparative assessment underscores {co}'s superior operating leverage, resilient execution track record, and sustainable client moats.{citations_text}"
-            )
-
-        # 6. Corporate Governance & Board Committees
-        elif any(k in title_lower for k in ["governance", "board", "committee", "director"]):
-            return (
-                f"### {task.title}\n\n"
-                f"{co} upholds the highest standards of corporate governance, transparency, and fiduciary accountability. "
-                f"The Board of Directors maintains an optimal balance of independent and non-executive members, ensuring thorough oversight, "
-                f"uncompromising ethical compliance, and robust stakeholder alignment.\n\n"
-                f"#### Statutory Board Committees & Mandates\n\n"
-                f"| Statutory Committee | Leadership Profile | Core Mandate & Oversight Area | Statutory Alignment |\n"
-                f"| :--- | :--- | :--- | :--- |\n"
-                f"| Audit Committee | Majority Independent Directors | Financial reporting integrity, statutory audit review, internal controls | Companies Act & Listing Norms |\n"
-                f"| Nomination & Remuneration | Independent Chair & Members | Board nominations, KMP performance evaluation, compensation policy | Listing Regulations |\n"
-                f"| Stakeholders Relationship | Non-Executive Leadership | Shareholder engagement, grievance redressal, registry oversight | Regulatory Mandate |\n"
-                f"| Risk Management Committee | Executive & Independent Directors | Enterprise risk framework, cybersecurity resilience, mitigation policy | Mandatory Risk Charter |\n"
-                f"| CSR & Sustainability | Independent & Executive Members | CSR program allocations, ESG governance, social impact monitoring | Statutory CSR Provisions |\n\n"
-                f"All committees function under formal charters and conduct periodic independent performance evaluations.{citations_text}"
-            )
-
-        # 7. Enterprise Risk & Cybersecurity
-        elif any(k in title_lower for k in ["risk", "cyber", "security", "erm"]):
-            return (
-                f"### {task.title}\n\n"
-                f"Enterprise Risk Management (ERM) at {co} operates as an integrated discipline to identify, prioritize, "
-                f"and mitigate strategic, technological, regulatory, and market risks across all global operating locations.\n\n"
-                f"#### Principal Risk Register & Mitigation Framework\n\n"
-                f"| Risk Category | Principal Risk Factor | Assessed Impact & Likelihood | Mitigation Strategy & Internal Controls |\n"
-                f"| :--- | :--- | :--- | :--- |\n"
-                f"| Strategic Market Risk | Discretionary client spending slowdowns | Moderate / Medium | High revenue diversification and multi-year contract base |\n"
-                f"| Cybersecurity & Privacy | Targeted cyber attacks & sensitive data exposure | High / Low-to-Medium | Zero-Trust architecture, ISO 27001 certification, 24/7 SOC |\n"
-                f"| Talent & Skills Shortage | Rapid shifts toward AI and Cloud specializations | Moderate / Medium | Continuous talent upskilling, university partnerships, competitive rewards |\n"
-                f"| Regulatory & Statutory | Global statutory compliance and cross-border trade | Moderate / Low | In-house legal counsel, external statutory compliance audits |\n"
-                f"| Foreign Exchange Volatility | Billing currency fluctuations against reporting base | Low-to-Moderate / High | Active hedging mechanisms governed by Board-approved Forex policy |\n\n"
-                f"The Board and Risk Management Committee review risk heat maps on a quarterly basis to ensure institutional resilience.{citations_text}"
-            )
-
-        # 8. Human Capital & Talent Analytics
-        elif any(k in title_lower for k in ["workforce", "talent", "human capital", "diversity", "employee", "demographic"]):
-            return (
-                f"### {task.title}\n\n"
-                f"Human capital forms the cornerstone of {co}'s sustainable enterprise value creation. The organization champions "
-                f"continuous skill evolution, inclusive leadership, and high employee engagement across its worldwide operations.\n\n"
-                f"#### Workforce Demographics & Talent Analytics\n\n"
-                f"| Human Capital Metric | Current Disclosed Status | Strategic Initiative | Industry Benchmark |\n"
-                f"| :--- | :--- | :--- | :--- |\n"
-                f"| Total Global Headcount | Scaled multi-national workforce | Scaled delivery across corporate centers | Global Delivery Network |\n"
-                f"| Gender Diversity Ratio | Progressive female representation across all tiers | Targeted women-in-leadership programs | Equal Opportunity Standard |\n"
-                f"| Talent Upskilling & Training | Scaled employee certifications in AI & Cloud | Corporate learning academies and hackathons | Future-Ready Workforce |\n"
-                f"| Annualized Attrition Rate | Within normalized industry parameters | Proactive career progression and wellness programs | Workforce Stability |\n"
-                f"| Health, Safety & Wellbeing | Comprehensive global employee care systems | Ergonomic and mental wellness programs | ISO 45001 Aligned |\n\n"
-                f"Sustained investments in employee upskilling enable {co} to meet emerging technology demand with agility.{citations_text}"
-            )
-
-        # 9. Sustainability, ESG & CSR
-        elif any(k in title_lower for k in ["sustainability", "esg", "brsr", "csr", "environment", "net zero", "climate"]):
-            return (
-                f"### {task.title}\n\n"
-                f"{co} is committed to responsible, sustainable corporate stewardship. Environmental preservation, societal advancement, "
-                f"and ethical governance remain central to institutional strategy across all operations and jurisdictions.\n\n"
-                f"#### Sustainability & ESG Performance Matrix\n\n"
-                f"| ESG Dimension | Corporate Target & Milestone | Implementation Program | Regulatory Alignment |\n"
-                f"| :--- | :--- | :--- | :--- |\n"
-                f"| Environmental (E) | Decarbonization & Net Zero milestone | Energy efficiency, green buildings, renewable power adoption | National Sustainability Framework |\n"
-                f"| Social Impact (S) | Community empowerment & STEM education | CSR initiatives supporting education and healthcare | Statutory CSR Mandates |\n"
-                f"| Corporate Governance (G) | Uncompromising business integrity | Code of Conduct, whistle-blower protection, vendor audits | Global Ethics Standards |\n"
-                f"| Resource Stewardship | Water conservation & zero waste to landfill | Rainwater harvesting, recycling, paperless operations | Circular Economy Principles |\n\n"
-                f"Disclosures are prepared in alignment with applicable statutory sustainability reporting principles (BRSR / GRI Standards).{citations_text}"
-            )
-
-        # 10. Financial Highlights, Ratios & Statements
-        elif any(k in title_lower for k in ["financial", "ratio", "balance sheet", "profit", "margin", "statement", "highlight"]):
-            return (
-                f"### {task.title}\n\n"
-                f"{co} recorded resilient financial performance during the reporting period, anchored by steady deal conversions, "
-                f"operational productivity, and disciplined cost governance. Operating cash flows remained strong, enabling continuous capital "
-                f"reinvestment while delivering consistent shareholder distributions.\n\n"
-                f"#### Key Financial Performance Indicators\n\n"
-                f"| Performance Indicator | Reporting Scale & Metric | Performance Trend | Financial Note |\n"
-                f"| :--- | :--- | :--- | :--- |\n"
-                f"| Total Revenue from Operations | {curr} Scaled in audited accounts | Positive operational momentum | Primary revenue from services |\n"
-                f"| Operating Profit (EBIT/EBITDA) | {curr} Consistent with margin targets | Disciplined cost management | Core operational earnings |\n"
-                f"| Net Profit After Tax (PAT) | {curr} Healthy bottom-line conversion | High cash conversion ratio | Attributable to equity holders |\n"
-                f"| Diluted Earnings Per Share (EPS) | {curr} Reflects equity capital base | Steady per-share returns | Measures shareholder return |\n"
-                f"| Return on Equity (ROE) | Percentage (%) metric | Industry benchmark tier | Efficient capital deployment |\n\n"
-                f"The Company retains an unleveraged capital structure, maintaining substantial liquid reserves to support strategic priorities.{citations_text}"
-            )
-
-        # 11. Shareholding Pattern & Investor Information
-        else:
-            return (
-                f"### {task.title}\n\n"
-                f"Equity shares of {co} are widely held by domestic and international institutional investors, promoters, and retail shareholders. "
-                f"The Company maintains transparent investor communications and prompt investor grievance redressal mechanisms.\n\n"
-                f"#### Capital Structure & Shareholding Distribution\n\n"
-                f"| Shareholder Category | Equity Holding Profile | Investment Horizon |\n"
-                f"| :--- | :--- | :--- |\n"
-                f"| Promoter & Promoter Group | Long-term anchor shareholding | Strategic Core Stability |\n"
-                f"| Foreign Portfolio Investors (FPIs/FIIs) | Diversified global institutional funds | Long-Term Global Capital |\n"
-                f"| Domestic Institutional Investors (Mutual Funds/Banks) | Domestic pension and mutual fund assets | Domestic Capital Formation |\n"
-                f"| Retail Public Shareholders & Corporate Bodies | Broad individual shareholder participation | Public Market Liquidity |\n\n"
-                f"The Company continues to maintain an active dividend distribution track record in compliance with its Board-approved Dividend Policy.{citations_text}"
-            )
-
-
-def execute_stage_parallel(
-    tasks: List[TaskDefinition],
-    prior_context: Dict[str, Any],
-    company_profile: CompanyProfile,
-    tools: Optional[ResearchTools] = None,
-    max_workers: Optional[int] = None,
-) -> Dict[str, TaskOutput]:
-    """Run independent tasks of one stage concurrently, each with its own agent instance."""
-    workers = max_workers if max_workers is not None else settings.MAX_PARALLEL_WORKERS
-    workers = min(workers, len(tasks)) if workers > 0 else 1
-    results: Dict[str, TaskOutput] = {}
-
-    def _run(t: TaskDefinition):
-        agent = GenericTaskExecutionAgent(agent_id=f"worker_{t.task_id[-8:]}", tools=tools)
-        return t.task_id, agent.execute_task(t, prior_context=prior_context, company_profile=company_profile)
-
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futures = [ex.submit(_run, t) for t in tasks]
-        for fut in as_completed(futures):
-            tid, out = fut.result()
-            results[tid] = out
-    return results
+        groups: Dict[str, List[int]] = {}
+        for n in sorted(cited):
+            if 1 <= n <= len(evidence):
+                e = evidence[n - 1]
+                key = e.source_title if e.origin == "knowledge_base" else (e.source_url or e.source_title)
+                groups.setdefault(key, [])
+                if e.page and e.page not in groups[key]:
+                    groups[key].append(e.page)
+        sources = [f"{k} (p. {', '.join(map(str, v))})" if v else k for k, v in groups.items()]
+        if sources:
+            text += "\n\n*Sources: " + "; ".join(sources) + "*"
+        return text, sources
