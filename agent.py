@@ -20,12 +20,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from config import get_llm, settings
+from config import QuotaExhausted, get_llm, settings
 from knowledge import KnowledgeBase
 from schemas import (EvidenceItem, ReportBlueprint, SourceDocument, TaskDefinition, TaskOutput, TaskStatus)
 from skills import get_style_guidance
 from tools import ResearchTools
-from utils import clean_llm_text, digest, word_count
+from utils import SPARSE_MARK, clean_llm_text, digest, word_count
 
 NOT_DISCLOSED = "Not disclosed in the sources reviewed"
 
@@ -40,6 +40,7 @@ class RunContext:
     texts: Dict[str, str] = field(default_factory=dict)
     digests: Dict[str, str] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    used_chunks: Dict[int, int] = field(default_factory=dict)   # chunk_id -> how many sections already use it
 
     def __post_init__(self):
         os.makedirs(self.draft_dir, exist_ok=True)
@@ -48,10 +49,14 @@ class RunContext:
             self.chapter_tasks.setdefault(t.chapter_id, []).append(t)
         self.chapter_titles = [c.title for c in self.blueprint.chapters]
         docs = self.blueprint.reference_documents
-        self.docs_note = "\n".join(
-            f"- {d.title}: period {d.fiscal_year or 'unknown'}"
-            f"{'' if d.matches_requested_period else ' (MAY NOT BE the requested period)'}"
-            for d in docs) or "- none found (only web snippets are available)"
+        def _note(d):
+            if d.kind == "web_corpus":
+                return f"- {d.title}: public web pages of mixed dates; state the period of every figure you use"
+            if d.kind == "sec_xbrl":
+                return f"- {d.title}: exact reported figures by fiscal year"
+            return (f"- {d.title}: period {d.fiscal_year or 'unknown'}"
+                    f"{'' if d.matches_requested_period else ' (MAY NOT BE the requested period)'}")
+        self.docs_note = "\n".join(_note(d) for d in docs) or "- none found (only web snippets are available)"
 
     def record(self, task_id: str, text: str) -> None:
         with self.lock:
@@ -87,7 +92,8 @@ class GenericTaskExecutionAgent:
                 self.ctx.record(task.task_id, cached)
                 self.from_cache = True
                 return TaskOutput(task_id=task.task_id, chapter_id=task.chapter_id, markdown_content=cached,
-                                  sources=sources, word_count=word_count(cached))
+                                  sources=sources, word_count=word_count(cached),
+                                  sparse=cached.startswith(SPARSE_MARK))
 
         print(f"[{self.agent_id}] Writing '{' > '.join(task.path)}' (~{task.target_words} words)")
         try:
@@ -102,6 +108,13 @@ class GenericTaskExecutionAgent:
                 for _ in range(settings.EXPAND_PASSES):
                     text = self._expand(task, text, evidence)
             body, sources = self._finalize(task, text, evidence)
+            body, sparse = self._compact_if_empty(task, body)
+            if sparse:
+                sources = []
+            else:
+                body = self._clean_tables(body)
+        except QuotaExhausted:
+            raise
         except Exception as e:
             print(f"[{self.agent_id}] FAILED '{task.title}': {e}")
             return TaskOutput(task_id=task.task_id, chapter_id=task.chapter_id, status=TaskStatus.FAILED,
@@ -116,7 +129,7 @@ class GenericTaskExecutionAgent:
         print(f"[{self.agent_id}] Done '{task.title}': {word_count(body)} words (target {task.target_words}), "
               f"{len(evidence)} evidence items")
         return TaskOutput(task_id=task.task_id, chapter_id=task.chapter_id, markdown_content=body,
-                          evidence_used=evidence, sources=sources, word_count=word_count(body))
+                          evidence_used=evidence, sources=sources, word_count=word_count(body), sparse=sparse)
 
     # ------------------------------------------------------------- research
     def _retrieve(self, task: TaskDefinition) -> List[EvidenceItem]:
@@ -127,7 +140,15 @@ class GenericTaskExecutionAgent:
             for ch, sc in self.ctx.kb.search(q, k=k):
                 if ch.chunk_id not in best or sc > best[ch.chunk_id][1]:
                     best[ch.chunk_id] = (ch, sc)
-        top = sorted(best.values(), key=lambda x: -x[1])[:k]
+        # Sections that share the same top chunks write the same text. Chunks other sections already use are
+        # down-weighted (not forbidden), so siblings draw on different parts of the source.
+        penalise = task.kind != "financial_statement"
+        with self.ctx.lock:
+            ranked = sorted(best.values(),
+                            key=lambda x: -(x[1] * (0.45 ** self.ctx.used_chunks.get(x[0].chunk_id, 0) if penalise else x[1])))
+            top = ranked[:k]
+            for ch, _ in top:
+                self.ctx.used_chunks[ch.chunk_id] = self.ctx.used_chunks.get(ch.chunk_id, 0) + 1
         top.sort(key=lambda x: (x[0].doc_id, x[0].page or 0))               # reading order
         out = []
         for i, (ch, sc) in enumerate(top, 1):
@@ -228,9 +249,15 @@ class GenericTaskExecutionAgent:
             f"3. Cite evidence inline as [E1], [E2]. Every figure carries its currency, unit and period. If evidence "
             f"comes from a different fiscal year than {self.ctx.blueprint.input_spec.financial_year}, say which year it is; "
             f"never present another year's figure as the requested year's.\n"
-            f"4. Tables: Markdown with a header row and '| --- |' separator; every row has the same number of columns.\n"
+            f"3b. NEVER put section titles in square brackets. To point to another part write 'see <title>' in plain "
+            f"words. The only square-bracket tokens allowed are [E#] evidence citations.\n"
+            f"4. Tables: Markdown with a header row and '| --- |' separator; every row has the same number of columns. "
+            f"When the EVIDENCE contains a relevant table (pipe-delimited rows), reproduce it with its exact row labels "
+            f"and values (drop only irrelevant columns/rows). Never write 'Not disclosed' for a value that is present "
+            f"in the evidence.\n"
             f"5. Stay inside this part's scope. Do not write what belongs to other parts; do not repeat what earlier "
-            f"parts already say.\n"
+            f"parts already say. Do NOT re-introduce the company, its general business description, its accounting "
+            f"basis or its fiscal-year definition: begin directly with this part's own content.\n"
             f"6. Length: aim for about {task.target_words} words where the evidence supports it. Be thorough where there "
             f"is data; never pad with generic filler or boilerplate to reach a length.\n"
             f"7. Output ONLY the Markdown body. Do NOT start with the part's own title (it is added automatically). "
@@ -285,10 +312,56 @@ EVIDENCE:
                                    max_tokens=max(1500, min(settings.MAX_OUTPUT_TOKENS, int(task.target_words * 3.2) + 600)))
             better = clean_llm_text(resp.content)
             return better if word_count(better) > word_count(draft) else draft
+        except QuotaExhausted:
+            raise
         except Exception:
             return draft
 
     # ------------------------------------------------------------ finishing
+    @staticmethod
+    def _compact_if_empty(task: TaskDefinition, body: str) -> Tuple[str, bool]:
+        """If 'Not disclosed' dominates the section, replace it with one honest line instead of empty tables."""
+        nd = body.lower().count(NOT_DISCLOSED.lower())
+        substantive = word_count(re.sub(re.escape(NOT_DISCLOSED), "", body, flags=re.I))
+        if nd >= 5 and substantive < 12 * nd:
+            print(f"  [Agent] '{task.title}': evidence missing ({nd} 'not disclosed' items) -> compact notice")
+            return (f"{SPARSE_MARK} Provide the company's own annual report or filing (--pdf) to populate "
+                    f"this section.*"), True
+        return body, False
+
+    @staticmethod
+    def _clean_tables(body: str) -> str:
+        """Drop table rows whose values are all 'Not disclosed', shorten remaining N/D cells, drop empty tables."""
+        nd_re = re.compile(r"^(not disclosed( in the sources reviewed)?|n/d|not available)\.?$", re.I)
+        lines, out, i = body.split("\n"), [], 0
+        while i < len(lines):
+            if not lines[i].lstrip().startswith("|"):
+                out.append(lines[i]); i += 1; continue
+            j = i
+            while j < len(lines) and lines[j].lstrip().startswith("|"):
+                j += 1
+            tbl = lines[i:j]
+            sep = next((n for n, l in enumerate(tbl[:3]) if re.match(r"^\|?[\s:\-|]+\|?$", l.strip()) and "-" in l), None)
+            if sep is None:
+                out += tbl; i = j; continue
+            head, rows, kept, replaced = tbl[:sep + 1], tbl[sep + 1:], [], False
+            for r in rows:
+                cells = [c.strip() for c in r.strip().strip("|").split("|")]
+                vals = cells[1:]
+                if vals and all(nd_re.match(c) or c == "" for c in vals) and any(nd_re.match(c) for c in vals):
+                    continue                                                  # nothing real in this row
+                if any(nd_re.match(c) for c in vals):
+                    cells = [cells[0]] + ["n/d" if nd_re.match(c) else c for c in vals]
+                    replaced = True
+                    r = "| " + " | ".join(cells) + " |"
+                kept.append(r)
+            if kept:
+                out += head + kept
+                if replaced:
+                    out += ["", "*n/d: not disclosed in the sources reviewed.*"]
+            i = j
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
     def _finalize(self, task: TaskDefinition, text: str, evidence: List[EvidenceItem]) -> Tuple[str, List[str]]:
         lines = text.strip().splitlines()
         while lines and re.match(r"^#{1,3}\s", lines[0].strip()) and \
@@ -296,6 +369,12 @@ EVIDENCE:
             lines.pop(0)                                                   # writer repeated the title
         text = "\n".join(lines).strip()
 
+        norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
+        known = {norm(t.title) for t in self.ctx.blueprint.tasks} | {norm(c) for c in self.ctx.chapter_titles}
+        text = re.sub(r"\s*\[([^\[\]\n]{4,160})\]",
+                      lambda m: "" if norm(m.group(1)) in known else
+                      (f" ({m.group(1).strip().lower()})" if norm(m.group(1)).startswith("not disclosed") else m.group(0)),
+                      text)
         cited = set()
         for m in re.finditer(r"\[((?:E\d+[\s,;]*)+)\]", text):
             cited.update(int(n) for n in re.findall(r"E(\d+)", m.group(1)))

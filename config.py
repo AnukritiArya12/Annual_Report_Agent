@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import random
+import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -65,7 +67,9 @@ class Settings:
     DEFAULT_TEMPERATURE: float = _float("DEFAULT_TEMPERATURE", 0.2)
     MAX_OUTPUT_TOKENS: int = _int("MAX_OUTPUT_TOKENS", 16384)
     REQUEST_TIMEOUT_SECONDS: int = _int("REQUEST_TIMEOUT_SECONDS", 240)
-    LLM_RETRIES: int = _int("LLM_RETRIES", 6)
+    LLM_RETRIES: int = _int("LLM_RETRIES", 4)
+    # minimum seconds between ANY two LLM requests (all threads share it). Free tiers cap requests per minute.
+    LLM_MIN_INTERVAL_SECONDS: float = _float("LLM_MIN_INTERVAL_SECONDS", 6.0 if LLM_PROVIDER == "gemini" else 0.0)
 
     # --- Report size (everything is derived from these, nothing is fixed) ----
     WORDS_PER_PAGE: int = _int("WORDS_PER_PAGE", 420)
@@ -76,8 +80,11 @@ class Settings:
     MAX_EXPANSION_DEPTH: int = _int("MAX_EXPANSION_DEPTH", 3)
 
     # --- Knowledge base / research ------------------------------------------
+    SEC_USER_AGENT: str = os.getenv("SEC_USER_AGENT", "AnnualReportAgent/1.0 research-use contact@example.com").strip()
+    WEB_CORPUS_PAGES: int = _int("WEB_CORPUS_PAGES", 30)
     MAX_REFERENCE_DOCS: int = _int("MAX_REFERENCE_DOCS", 2)
     MAX_DOWNLOAD_MB: int = _int("MAX_DOWNLOAD_MB", 150)
+    PDF_TABLES: bool = _bool("PDF_TABLES", True)       # extract real tables from PDFs (slower, far better numbers)
     CHUNK_WORDS: int = _int("CHUNK_WORDS", 300)
     CHUNK_OVERLAP_WORDS: int = _int("CHUNK_OVERLAP_WORDS", 50)
     RETRIEVAL_TOP_K: int = _int("RETRIEVAL_TOP_K", 10)
@@ -104,6 +111,26 @@ settings = Settings()
 class LLMResponse:
     def __init__(self, content: str):
         self.content = content
+
+
+class QuotaExhausted(RuntimeError):
+    """The provider's quota / rate limit is used up. Retrying now is pointless: the run stops cleanly and can be
+    continued later with --resume."""
+
+
+_throttle_lock = threading.Lock()
+_last_call = [0.0]
+
+
+def _throttle() -> None:
+    gap = settings.LLM_MIN_INTERVAL_SECONDS
+    if gap <= 0:
+        return
+    with _throttle_lock:                       # holding the lock while sleeping spaces calls out across threads
+        wait = _last_call[0] + gap - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
 
 
 def _split_messages(messages: List[Any]) -> Tuple[str, List[Dict[str, str]]]:
@@ -137,24 +164,48 @@ class _BaseClient:
     def _post(self, url: str, headers: Optional[dict] = None, payload: Optional[dict] = None) -> dict:
         import requests
         last: Any = None
+        timeouts = 0
+        rate_limited = False
         for attempt in range(max(1, settings.LLM_RETRIES)):
+            _throttle()
             try:
                 r = requests.post(url, headers=headers, json=payload, timeout=settings.REQUEST_TIMEOUT_SECONDS)
-                if r.status_code in (429, 500, 502, 503, 504):
-                    last = RuntimeError(f"{self.provider} HTTP {r.status_code}: {r.text[:300]}")
+                if r.status_code == 429:
+                    body = r.text
+                    if re.search(r"PerDay|per day|daily|insufficient_quota", body, re.I):
+                        raise QuotaExhausted(f"{self.provider}: DAILY quota is used up. Wait until it resets "
+                                             f"(for Gemini: midnight Pacific time) and continue with --resume. "
+                                             f"Details: {body[:200]}")
+                    rate_limited = True
+                    m = re.search(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"', body)
+                    wait = float(m.group(1)) if m else 0.0
                     try:
-                        wait = float(r.headers.get("retry-after", 0))
+                        wait = wait or float(r.headers.get("retry-after", 0))
                     except ValueError:
-                        wait = 0.0
-                    if wait:
-                        time.sleep(min(90.0, wait))
+                        pass
+                    last = RuntimeError(f"{self.provider} HTTP 429 (rate limit)")
+                    print(f"[LLM] rate limit hit; waiting {max(wait, 2 ** attempt):.0f}s (attempt {attempt + 1}/{settings.LLM_RETRIES})", flush=True)
+                    time.sleep(min(90.0, max(wait, 2 ** attempt)))
+                    continue
+                rate_limited = False
+                if r.status_code in (500, 502, 503, 504):
+                    last = RuntimeError(f"{self.provider} HTTP {r.status_code}: {r.text[:300]}")
                 elif not r.ok:
                     raise RuntimeError(f"{self.provider} API error [{r.status_code}]: {r.text[:600]}")
                 else:
                     return r.json()
             except (requests.Timeout, requests.ConnectionError) as e:
                 last = e
+                if isinstance(e, requests.Timeout):
+                    timeouts += 1
+                    print(f"[LLM] {self.provider} timed out after {settings.REQUEST_TIMEOUT_SECONDS}s "
+                          f"(attempt {attempt + 1}). The model is too slow for this request size.", flush=True)
+                    if timeouts >= 2:          # do not burn hours retrying a request that cannot finish
+                        break
             time.sleep(min(60.0, 2 ** attempt + random.random()))
+        if rate_limited:
+            raise QuotaExhausted(f"{self.provider}: rate limit still active after {settings.LLM_RETRIES} attempts. "
+                                 f"Wait a few minutes (or raise LLM_MIN_INTERVAL_SECONDS) and continue with --resume.")
         raise RuntimeError(f"{self.provider} request failed after retries: {last}")
 
     def invoke(self, messages: List[Any], max_tokens: Optional[int] = None) -> LLMResponse:

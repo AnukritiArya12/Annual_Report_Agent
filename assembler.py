@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import os
 import re
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from schemas import ReportBlueprint, TaskOutput, TaskStatus
 from tools import ResearchTools
+from utils import SPARSE_MARK, tokenize
 
 
 # ------------------------------------------------------------------------------
@@ -120,6 +122,56 @@ class ReportAssembler:
     def __init__(self, tools: Optional[ResearchTools] = None):
         self.tools = tools
 
+    # ----------------------------------------------------- repetition removal
+    def remove_repetition(self, blueprint: ReportBlueprint, outputs: Dict[str, TaskOutput],
+                          para_limit: float = 0.6) -> Tuple[int, int]:
+        """Report-wide pass: delete paragraphs that repeat earlier text and tables identical to earlier ones.
+        Deterministic (no LLM): sections are walked in report order, the first occurrence always stays."""
+        index: Dict[int, set] = defaultdict(set)
+        seen_tables: set = set()
+        n_par = 0
+        removed_p = removed_t = 0
+        tasks = {t.task_id: t for t in blueprint.tasks}
+        for ch in sorted(blueprint.chapters, key=lambda c: c.sequence_order):
+            for tid in ch.task_ids:
+                out = outputs.get(tid)
+                if not out or out.status == TaskStatus.FAILED or out.markdown_content.startswith(SPARSE_MARK):
+                    continue
+                kept: List[str] = []
+                dropped = 0
+                for block in re.split(r"\n\s*\n", out.markdown_content):
+                    s = block.strip()
+                    if not s:
+                        continue
+                    if s.startswith(("#", "*Sources:", "*n/d")):
+                        kept.append(block); continue
+                    if s.startswith("|"):
+                        key = re.sub(r"\s+", " ", s.lower())
+                        if key in seen_tables:
+                            removed_t += 1; dropped += 1; continue
+                        seen_tables.add(key); kept.append(block); continue
+                    toks = tokenize(s)
+                    if len(toks) < 20:
+                        kept.append(block); continue
+                    sh = {hash(" ".join(toks[i:i + 4])) for i in range(len(toks) - 3)}
+                    hits: Counter = Counter()
+                    for h in sh:
+                        for pid in index.get(h, ()):
+                            hits[pid] += 1
+                    if sh and max(hits.values(), default=0) / len(sh) >= para_limit:
+                        removed_p += 1; dropped += 1; continue
+                    for h in sh:
+                        index[h].add(n_par)
+                    n_par += 1
+                    kept.append(block)
+                if dropped:
+                    body = "\n\n".join(kept).strip()
+                    real = [b for b in kept if not b.strip().startswith(("#", "*Sources:", "*n/d"))]
+                    out.markdown_content = body if sum(len(b.split()) for b in real) >= 15 else \
+                        "*This topic is covered in other sections of this report.*"
+        print(f"[Assembler] Repetition removal: {removed_p} repeated paragraphs and {removed_t} duplicate tables removed.")
+        return removed_p, removed_t
+
     # ---------------------------------------------------------------- markdown
     def assemble_markdown(self, blueprint: ReportBlueprint, outputs: Dict[str, TaskOutput], out_file: str) -> str:
         p, spec = blueprint.company_profile, blueprint.input_spec
@@ -144,6 +196,7 @@ class ReportAssembler:
 
         tasks = {t.task_id: t for t in blueprint.tasks}
         failed: List[str] = []
+        sparse: List[str] = []
         for ch in chapters:
             emitted: List[str] = []
             for tid in ch.task_ids:
@@ -158,6 +211,8 @@ class ReportAssembler:
                 if out and out.markdown_content.strip():
                     if out.status == TaskStatus.FAILED:
                         failed.append(" > ".join(path))
+                    if out.markdown_content.strip().startswith(SPARSE_MARK):
+                        sparse.append(" > ".join(path))
                     L.append(self._demote_headings(out.markdown_content.strip(), len(path)))
                 else:
                     failed.append(" > ".join(path))
@@ -173,12 +228,20 @@ class ReportAssembler:
         if blueprint.reference_documents:
             L.append("**Reference documents used for structure and content:**\n")
             for d in blueprint.reference_documents:
-                note = "" if d.matches_requested_period else " - NOTE: period may differ from the requested year"
+                if d.kind == "web_corpus":
+                    L.append(f"- {d.title}:")
+                    L += [f"  - {u}" for u in d.urls[:60]]
+                    continue
+                note = "" if d.matches_requested_period in (True, None) else " - NOTE: period may differ from the requested year"
                 L.append(f"- {d.title}{(' (' + d.url + ')') if d.url else ''}{note}")
         else:
             L.append("No reference report could be loaded; content comes from web search results only.")
         if p.applicable_regulations:
             L.append(f"\n**Frameworks identified as applicable:** {', '.join(p.applicable_regulations)}")
+        if sparse:
+            L.append(f"\n**Sections with no usable source material ({len(sparse)}):** provide the company's own report "
+                     f"to populate them.\n")
+            L += [f"- {s}" for s in sparse]
         if failed:
             L.append("\n**Sections that could not be generated:**\n")
             L += [f"- {f}" for f in failed]

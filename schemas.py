@@ -57,6 +57,7 @@ class SourceDocument(BaseModel):
     fiscal_year: str = ""
     matches_requested_period: Optional[bool] = None
     pages: int = 0
+    urls: List[str] = Field(default_factory=list)   # for web_corpus: every page used
 
 
 class TaskDefinition(BaseModel):
@@ -138,6 +139,7 @@ class TaskOutput(BaseModel):
     status: TaskStatus = TaskStatus.COMPLETED
     error_message: Optional[str] = None
     word_count: int = 0
+    sparse: bool = False        # True when the section had no usable evidence
 
 
 class ValidationResult(BaseModel):

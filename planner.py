@@ -23,7 +23,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from config import get_llm, settings
+from config import QuotaExhausted, get_llm, settings
 from knowledge import KnowledgeBase
 from schemas import (ChapterBlueprint, CompanyProfile, ReportBlueprint, ReportInput,
                      SourceDocument, TaskDefinition)
@@ -93,18 +93,42 @@ disclosure rules that really apply to this company in its country), reporting_fr
         try:
             data = self._ask_json(system, user)
             allowed = set(CompanyProfile.model_fields) - {"researched_at"}
-            data = {k: v for k, v in data.items() if k in allowed and v is not None}
+            data = self._coerce_profile({k: v for k, v in data.items() if k in allowed and v is not None})
             data["company_name"] = co
             data["country"] = data.get("country") or spec.country
             data["industry"] = data.get("industry") or spec.industry or "Unknown"
             data["official_sources"] = list(dict.fromkeys(official))[:5]
             profile = CompanyProfile(**data)
+        except QuotaExhausted:
+            raise
         except Exception as e:
             print(f"[Planner] Profile step failed ({e}); continuing with a minimal profile (no invented facts).")
             profile = CompanyProfile(company_name=co, country=spec.country, industry=spec.industry or "Unknown",
                                      official_sources=official[:5])
         print(f"[Planner] Profile: {profile.industry} | {profile.country} | {profile.reporting_framework or 'framework n/a'}")
         return profile
+
+    @staticmethod
+    def _coerce_profile(data: Dict[str, Any]) -> Dict[str, Any]:
+        """LLMs often return a string where a list is expected (or the reverse); normalise instead of failing."""
+        list_fields = [k for k, f in CompanyProfile.model_fields.items()
+                       if k in ("key_business_segments", "geographic_presence", "applicable_regulations",
+                                "official_sources", "peer_competitors")]
+        for k in list_fields:
+            v = data.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str):
+                v = [x.strip() for x in v.replace(";", ",").split(",") if x.strip()]
+            data[k] = [x if isinstance(x, str) else json.dumps(x, ensure_ascii=False) for x in v]
+        for k in ("country", "industry", "ticker_or_id", "sector", "business_model_summary",
+                  "listing_status", "reporting_framework"):
+            v = data.get(k)
+            if isinstance(v, list):
+                data[k] = ", ".join(str(x) for x in v)
+            elif v is not None and not isinstance(v, str):
+                data[k] = str(v)
+        return data
 
     # -------------------------------------------------- 2. structure evidence
     def _structure_evidence(self, spec: ReportInput, profile: CompanyProfile, reference_toc: str) -> str:
@@ -182,6 +206,8 @@ Return JSON: {{"missing_chapters": [<chapter objects with est_pages>], "irreleva
 Chapter object shape: {NODE_SHAPE} plus est_pages, chapter_id, rationale."""
         try:
             review = self._ask_json(system, user, retries=2)
+        except QuotaExhausted:
+            raise
         except Exception as e:
             print(f"[Planner] Critic pass skipped ({e}).")
             return chapters
@@ -214,13 +240,18 @@ Split it into between {n_min} and {n_max} sub-parts so that each sub-part is rou
 table of contents shows them; otherwise use what this kind of company and jurisdiction publishes.
 Sub-parts must not repeat each other: each owns a distinct slice of the content.
 Return JSON: {{"subsections": [ {NODE_SHAPE} ]}}"""
+        print(f"[Planner] Splitting '{node['title']}' (~{int(words)} words) into {n_min}-{n_max} parts...", flush=True)
         try:
             data = self._ask_json(system, user)
+        except QuotaExhausted:
+            raise
         except Exception as e:
             print(f"[Planner] Could not split '{node['title']}' ({e}); keeping it as one section.")
             return []
         subs = data.get("subsections") if isinstance(data, dict) else data
-        return [s for s in (subs or []) if isinstance(s, dict) and s.get("title")]
+        subs = [s for s in (subs or []) if isinstance(s, dict) and s.get("title")]
+        print(f"[Planner]   '{node['title']}' -> {len(subs)} parts", flush=True)
+        return subs
 
     def _expand(self, node: dict, words: float, depth: int, sibling_titles: List[str],
                 spec, profile, structure_evidence) -> dict:

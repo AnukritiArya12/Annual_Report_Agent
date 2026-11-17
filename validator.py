@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List
 
-from config import get_llm, settings
+from config import QuotaExhausted, get_llm, settings
 from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult
 from utils import extract_json, shingle_set, word_count
 
@@ -115,6 +115,8 @@ Draft:
                                                  {"role": "user", "content": user}], max_tokens=800).content)
             if isinstance(data, dict) and str(data.get("verdict", "")).upper().startswith("FAIL"):
                 return [str(i) for i in (data.get("issues") or ["Reviewer rejected the section."])][:4]
+        except QuotaExhausted:
+            raise
         except Exception:
             pass          # reviewer unavailable: rely on the programmatic checks above
         return []

@@ -67,3 +67,7 @@ def digest(text: str, max_chars: int = 400) -> str:
     out = " ".join(lines)
     out = re.sub(r"\s+", " ", out)
     return out[:max_chars] + ("..." if len(out) > max_chars else "")
+
+
+# Sections whose evidence was missing are replaced by this one-line notice instead of tables full of "Not disclosed".
+SPARSE_MARK = "*Not available in the public sources reviewed."

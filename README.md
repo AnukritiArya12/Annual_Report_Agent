@@ -2,6 +2,12 @@
 
 One agent that builds an annual report for ANY company. Nothing about the structure is hardcoded.
 
+## Setup (Windows PowerShell)
+```
+pip install -r requirements.txt
+python check_setup.py          # lists missing / outdated files and packages
+```
+
 ## Run
 ```
 pip install -r requirements.txt
@@ -13,8 +19,9 @@ python main.py "Company Name" --fy "FY 2024-25" --resume     # continue / retry 
 Outputs go to `runs/<company>_<fy>/`: `.pdf`, `.docx`, `.md`, `blueprint.json` (the plan), `run_report.json`.
 
 ## How it stays generic
-1. **Ingest** - finds (or you give with `--pdf`) the company's real annual report, reads it with PyMuPDF,
-   stores page-tagged chunks in a BM25 knowledge base.
+1. **Ingest** - the agent finds its own sources, no file needed: SEC EDGAR 10-K/20-F + XBRL figures, then official
+   annual-report PDFs (search + investor-relations page crawl), then a broad public web corpus. `--pdf` is only an
+   optional override. Everything goes into a page-tagged BM25 knowledge base.
 2. **Plan** - the LLM designs the chapters from the report's own table of contents, the country's rules and the
    industry. A critic pass adds/removes chapters. Each chapter gets a word budget (from the target page count) and is
    split recursively into sections until each writing task is small. No fallback outline exists.
@@ -23,6 +30,12 @@ Outputs go to `runs/<company>_<fy>/`: `.pdf`, `.docx`, `.md`, `blueprint.json` (
    instead of inventing.
 4. **Validate** - grounding of numbers, duplication across sections, length vs evidence, planner-set criteria, LLM review.
 5. **Assemble** - headings follow the plan; DOCX has a TOC field, PDF has a TOC with page numbers.
+
+## Tables and repetition
+- SEC filings and web pages keep their real HTML tables (and PDFs their real tables) as Markdown; tables are chunked whole so
+  rows/columns stay aligned. Table rows that would only say 'Not disclosed' are dropped.
+- Sections draw on different evidence (chunks already used elsewhere are down-weighted), writers may not re-introduce
+  the company, and a final report-wide pass deletes repeated paragraphs and duplicate tables.
 
 ## Limits to know
 - Length is bounded by the evidence. A 300-page report needs the company's real report/filings loaded; with web
