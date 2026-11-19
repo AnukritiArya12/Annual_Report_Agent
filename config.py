@@ -75,9 +75,9 @@ class Settings:
     WORDS_PER_PAGE: int = _int("WORDS_PER_PAGE", 420)
     MIN_PAGES: int = _int("MIN_PAGES", 30)
     MAX_PAGES: int = _int("MAX_PAGES", 500)
-    LEAF_MAX_WORDS: int = _int("LEAF_MAX_WORDS", 700)   # a section bigger than this is split further
-    MIN_LEAF_WORDS: int = _int("MIN_LEAF_WORDS", 120)
-    MAX_EXPANSION_DEPTH: int = _int("MAX_EXPANSION_DEPTH", 3)
+    LEAF_MAX_WORDS: int = _int("LEAF_MAX_WORDS", 1200)   # a section bigger than this is split further
+    MIN_LEAF_WORDS: int = _int("MIN_LEAF_WORDS", 250)
+    MAX_EXPANSION_DEPTH: int = _int("MAX_EXPANSION_DEPTH", 1)
 
     # --- Knowledge base / research ------------------------------------------
     SEC_USER_AGENT: str = os.getenv("SEC_USER_AGENT", "AnnualReportAgent/1.0 research-use contact@example.com").strip()
@@ -87,7 +87,7 @@ class Settings:
     PDF_TABLES: bool = _bool("PDF_TABLES", True)       # extract real tables from PDFs (slower, far better numbers)
     CHUNK_WORDS: int = _int("CHUNK_WORDS", 300)
     CHUNK_OVERLAP_WORDS: int = _int("CHUNK_OVERLAP_WORDS", 50)
-    RETRIEVAL_TOP_K: int = _int("RETRIEVAL_TOP_K", 10)
+    RETRIEVAL_TOP_K: int = _int("RETRIEVAL_TOP_K", 15)
     MIN_KB_HITS_BEFORE_WEB: int = _int("MIN_KB_HITS_BEFORE_WEB", 4)
     MAX_SEARCH_RESULTS: int = _int("MAX_SEARCH_RESULTS", 4)
     MAX_EVIDENCE_CHARS: int = _int("MAX_EVIDENCE_CHARS", 16000)
@@ -166,13 +166,14 @@ class _BaseClient:
         last: Any = None
         timeouts = 0
         rate_limited = False
-        for attempt in range(max(1, settings.LLM_RETRIES)):
+        max_attempts = max(8, settings.LLM_RETRIES)
+        for attempt in range(max_attempts):
             _throttle()
             try:
                 r = requests.post(url, headers=headers, json=payload, timeout=settings.REQUEST_TIMEOUT_SECONDS)
                 if r.status_code == 429:
                     body = r.text
-                    if re.search(r"PerDay|per day|daily|insufficient_quota", body, re.I):
+                    if re.search(r"PerDay|per day|daily|insufficient_quota|free_tier_requests_per_day", body, re.I):
                         raise QuotaExhausted(f"{self.provider}: DAILY quota is used up. Wait until it resets "
                                              f"(for Gemini: midnight Pacific time) and continue with --resume. "
                                              f"Details: {body[:200]}")
@@ -184,8 +185,11 @@ class _BaseClient:
                     except ValueError:
                         pass
                     last = RuntimeError(f"{self.provider} HTTP 429 (rate limit)")
-                    print(f"[LLM] rate limit hit; waiting {max(wait, 2 ** attempt):.0f}s (attempt {attempt + 1}/{settings.LLM_RETRIES})", flush=True)
-                    time.sleep(min(90.0, max(wait, 2 ** attempt)))
+                    wait_sec = min(90.0, max(wait, 20.0 + 5.0 * attempt))
+                    with _throttle_lock:
+                        _last_call[0] = time.time() + wait_sec
+                    print(f"[LLM] rate limit hit; waiting {wait_sec:.0f}s (attempt {attempt + 1}/{max_attempts})", flush=True)
+                    time.sleep(wait_sec)
                     continue
                 rate_limited = False
                 if r.status_code in (500, 502, 503, 504):
@@ -200,11 +204,11 @@ class _BaseClient:
                     timeouts += 1
                     print(f"[LLM] {self.provider} timed out after {settings.REQUEST_TIMEOUT_SECONDS}s "
                           f"(attempt {attempt + 1}). The model is too slow for this request size.", flush=True)
-                    if timeouts >= 2:          # do not burn hours retrying a request that cannot finish
+                    if timeouts >= 3:          # do not burn hours retrying a request that cannot finish
                         break
-            time.sleep(min(60.0, 2 ** attempt + random.random()))
+            time.sleep(min(30.0, 2 ** attempt + random.random()))
         if rate_limited:
-            raise QuotaExhausted(f"{self.provider}: rate limit still active after {settings.LLM_RETRIES} attempts. "
+            raise QuotaExhausted(f"{self.provider}: rate limit still active after {max_attempts} attempts. "
                                  f"Wait a few minutes (or raise LLM_MIN_INTERVAL_SECONDS) and continue with --resume.")
         raise RuntimeError(f"{self.provider} request failed after retries: {last}")
 
@@ -222,12 +226,12 @@ class OllamaClient(_BaseClient):
     def invoke(self, messages, max_tokens=None):
         system, turns = _split_messages(messages)
         msgs = ([{"role": "system", "content": system}] if system else []) + turns
+        pred = max_tokens or self.max_tokens or 2048
         payload: Dict[str, Any] = {
             "model": self.model, "messages": msgs, "stream": False,
             "options": {"temperature": self.temperature,
-                        "num_ctx": settings.OLLAMA_NUM_CTX,
-                        # reasoning models (gpt-oss, qwen3) spend tokens on thinking: never go very low
-                        "num_predict": max(max_tokens or self.max_tokens, 4096)},
+                        "num_ctx": min(settings.OLLAMA_NUM_CTX, 8192),
+                        "num_predict": pred},
         }
         if settings.OLLAMA_THINK in ("low", "medium", "high"):
             payload["think"] = settings.OLLAMA_THINK
@@ -238,15 +242,24 @@ class OllamaClient(_BaseClient):
                 raise ConnectionError(f"Could not reach Ollama at {self.base_url}. "
                                       f"Is it running ('ollama serve')? Details: {e}")
             raise
-        return LLMResponse(data.get("message", {}).get("content", ""))
+        content = data.get("message", {}).get("content", "")
+        if not content and "thinking" in data.get("message", {}):
+            content = data["message"]["thinking"]
+        return LLMResponse(content)
 
 
 class GeminiClient(_BaseClient):
     provider = "gemini"
+    _FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest", "gemini-2.5-flash-lite", "gemini-3.8-flash"]
 
     def __init__(self, model=None, temperature=None, max_tokens=None, api_key=None):
-        # Gemini model ids are lowercase ("gemini-2.5-flash-lite"); normalise typos like "...-Lite"
-        super().__init__((model or settings.GEMINI_MODEL).strip().lower(), temperature, max_tokens)
+        raw_model = (model or settings.GEMINI_MODEL).strip().lower()
+        # Normalise common typos and deprecated IDs
+        if "3.5" in raw_model or "lite" in raw_model:
+            raw_model = "gemini-flash-lite-latest"
+        elif raw_model in ("gemini-flash", "flash", "gemini-2.0-flash"):
+            raw_model = "gemini-flash-latest"
+        super().__init__(raw_model, temperature, max_tokens)
         self.api_key = api_key or settings.GEMINI_API_KEY
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY is missing (set it in .env).")
@@ -258,24 +271,39 @@ class GeminiClient(_BaseClient):
         payload: Dict[str, Any] = {
             "contents": contents,
             "generationConfig": {"temperature": self.temperature,
-                                 # thinking tokens count against this limit, so never go very low
-                                 "maxOutputTokens": max(max_tokens or self.max_tokens, 4096)},
+                                 "maxOutputTokens": max(max_tokens or self.max_tokens, 2048)},
         }
         if system:
             payload["system_instruction"] = {"parts": [{"text": system}]}
-        data = self._post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
-            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
-            payload=payload,
-        )
-        cands = data.get("candidates") or []
-        if not cands:
-            raise RuntimeError(f"Gemini returned no candidates: {str(data.get('promptFeedback', data))[:300]}")
-        parts = cands[0].get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts)
-        if not text.strip():
-            raise RuntimeError(f"Gemini returned empty text (finishReason={cands[0].get('finishReason')}).")
-        return LLMResponse(text)
+
+        models_to_try = [self.model] + [m for m in self._FALLBACK_MODELS if m != self.model]
+        last_err = None
+        for cand_model in models_to_try:
+            try:
+                data = self._post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{cand_model}:generateContent",
+                    headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+                    payload=payload,
+                )
+                cands = data.get("candidates") or []
+                if not cands:
+                    raise RuntimeError(f"Gemini returned no candidates: {str(data.get('promptFeedback', data))[:300]}")
+                parts = cands[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts)
+                if not text.strip():
+                    raise RuntimeError(f"Gemini returned empty text (finishReason={cands[0].get('finishReason')}).")
+                self.model = cand_model  # stick to working model
+                return LLMResponse(text)
+            except QuotaExhausted:
+                raise
+            except Exception as e:
+                err_str = str(e)
+                if "404" in err_str or "503" in err_str or "not found" in err_str.lower():
+                    print(f"[Gemini] Model '{cand_model}' failed ({err_str[:90]}), switching to fallback...", flush=True)
+                    last_err = e
+                    continue
+                raise
+        raise RuntimeError(f"All Gemini fallback models failed: {last_err}")
 
 
 class OpenAIClient(_BaseClient):

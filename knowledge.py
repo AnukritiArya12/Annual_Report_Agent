@@ -27,10 +27,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from config import settings
+from config import get_llm, settings
 from schemas import ReportInput, SourceDocument
 from tools import ResearchTools, rows_to_markdown
-from utils import slug, tokenize
+from utils import extract_json, slug, tokenize
 
 _STOP = set("a an and are as at be by for from has have in is it its of on or that the this to was were will with".split())
 
@@ -275,6 +275,8 @@ _BAD_DOMAINS = ("wikipedia", "youtube", "facebook", "linkedin", "glassdoor", "in
                 "pinterest", "reddit", "quora", "tiktok", "amazon.", "flipkart")
 _NOT_ANNUAL = ("quarter", "q1", "q2", "q3", "q4", "presentation", "press-release", "pressrelease", "earnings",
                "transcript", "newsletter", "factsheet", "fact-sheet", "notice-of", "proxy", "esg-data", "ppt")
+_STRONG_BAD = ("environmental", "diversity", "gender", "pay-gap", "paygap", "pay_gap", "slavery", "tax-transparency",
+               "human-rights", "supplier", "brochure", "catalog")
 
 
 def _target_end_year(fy: str) -> Optional[int]:
@@ -306,11 +308,46 @@ class ReferenceIngestor:
         self.kb = kb
         self.dir = os.path.join(run_dir, "sources")
         self.contents: Dict[str, str] = {}     # doc_id -> table-of-contents text of that document
+        self.names: List[str] = []             # every name the company is known by (brand, legal name, parent)
+        self.ticker = ""
         os.makedirs(self.dir, exist_ok=True)
+
+    # --------------------------------------------------------- entity resolution
+    def _resolve_entity(self, spec: ReportInput) -> None:
+        """'Google' files nothing; its parent 'Alphabet Inc.' does. Ask which legal entity publishes the report."""
+        self.names = [spec.company_name]
+        try:
+            system = "You identify which legal entity publishes a company's annual report. Return ONLY JSON."
+            user = (f'Name given by the user: "{spec.company_name}" (country: {spec.country or "unknown"}).\n'
+                    "If this is a brand, product or subsidiary, give the listed parent / reporting entity that files the "
+                    'annual report. Return JSON: {"legal_name": "", "ticker": "", "also_known_as": []}. '
+                    "Leave a field empty if you are not sure. Never guess.")
+            data = extract_json(get_llm().invoke([{"role": "system", "content": system},
+                                                  {"role": "user", "content": user}]).content)
+            legal = str(data.get("legal_name") or "").strip()
+            self.ticker = str(data.get("ticker") or "").strip().upper()
+            more = [str(x).strip() for x in (data.get("also_known_as") or []) if isinstance(x, str)]
+            for n in [legal] + more:
+                if n and n.lower() not in [x.lower() for x in self.names]:
+                    self.names.append(n)
+            if len(self.names) > 1 or self.ticker:
+                print(f"  [Ingest] Reporting entity: '{spec.company_name}' -> {', '.join(self.names[1:]) or '(same)'}"
+                      f"{' | ticker ' + self.ticker if self.ticker else ''}")
+        except Exception as e:                 # quota errors etc. surface later, in planning, with a clear message
+            print(f"  [Ingest] Entity lookup skipped ({str(e)[:80]})")
+
+    def _name_tokens(self) -> List[str]:
+        toks: List[str] = []
+        for n in self.names:
+            for t in tokenize(n):
+                if len(t) > 2 and t not in _CORP_WORDS and t not in toks:
+                    toks.append(t)
+        return toks
 
     # ------------------------------------------------------------------- main
     def ingest(self, spec: ReportInput) -> List[SourceDocument]:
         self._check_search(spec)
+        self._resolve_entity(spec)
         docs: List[SourceDocument] = []
         for src in spec.source_documents:                              # optional manual override
             d = self._ingest_one(src, spec, kind="user_supplied", url_ok=True)
@@ -348,15 +385,24 @@ class ReferenceIngestor:
         if not data:
             print(f"  [Ingest]   EDGAR not reachable ({self.tools.last_fetch_error})")
             return []
-        toks = [t for t in tokenize(spec.company_name) if t not in _CORP_WORDS]
-        if not toks:
+        best = None
+        if self.ticker:                                        # a ticker is the most reliable key
+            by_ticker = [v for v in data.values() if str(v.get("ticker", "")).upper() == self.ticker]
+            best = by_ticker[0] if by_ticker else None
+        for name in self.names:
+            if best:
+                break
+            toks = [t for t in tokenize(name) if t not in _CORP_WORDS]
+            if not toks:
+                continue
+            matches = [v for v in data.values() if all(t in tokenize(v.get("title", "")) for t in toks)]
+            if matches:
+                exact = [v for v in matches if [w for w in tokenize(v["title"]) if w not in _CORP_WORDS] == toks]
+                best = (exact or sorted(matches, key=lambda v: len(v["title"])))[0]
+        if not best:
+            print(f"  [Ingest]   no SEC registrant found for {', '.join(self.names)} "
+                  "(normal for non-US companies; US ones are matched by ticker or legal name)")
             return []
-        matches = [v for v in data.values() if all(t in tokenize(v.get("title", "")) for t in toks)]
-        if not matches:
-            print("  [Ingest]   not an SEC registrant (normal for non-US companies)")
-            return []
-        exact = [v for v in matches if [w for w in tokenize(v["title"]) if w not in _CORP_WORDS] == toks]
-        best = (exact or sorted(matches, key=lambda v: len(v["title"])))[0]
         cik10 = str(best["cik_str"]).zfill(10)
         print(f"  [Ingest]   SEC match: {best['title']} ({best.get('ticker', '?')}, CIK {cik10})")
 
@@ -439,33 +485,46 @@ class ReferenceIngestor:
 
     # ------------------------------------------- 2. annual-report PDFs (web)
     @staticmethod
-    def _score(url: str, text: str, co_tok: List[str], year_toks: List[str]) -> int:
+    def _score(url: str, text: str, co_tok: List[str], year_toks: List[str], trusted: bool = False) -> int:
         low = (url + " " + text).lower()
         if any(b in low for b in _BAD_DOMAINS):
             return 0
+        if co_tok and not trusted and not any(t in low for t in co_tok):
+            return 0                                   # a report of some OTHER company is never a candidate
         s = 0
         path = url.lower().split("?")[0]
         s += 3 if path.endswith(".pdf") else 0
         s += 2 if re.search(r"annual|integrated[\s_-]*report|10-?k|20-?f|form[\s_-]*10", low) else 0
-        s += 2 if any(y in low for y in year_toks) else 0
+        if year_toks:
+            if any(y in low for y in year_toks):
+                s += 2
+            else:
+                other = re.findall(r"20\d{2}", low)
+                if other and not any(o in year_toks for o in other):
+                    s -= 2                             # clearly a different year
         s += 1 if any(t in low for t in co_tok) else 0
         s -= 3 if any(b in low for b in _NOT_ANNUAL) else 0
+        s -= 4 if any(b in low for b in _STRONG_BAD) or re.search(r"(?<![a-z])esg(?![a-z])", low) else 0
+        if not re.search(r"annual|integrated", low) and re.search(r"sustainab|responsibility", low):
+            s -= 3
         return s
 
     def _discover_reports(self, spec: ReportInput) -> List[SourceDocument]:
-        co, fy = spec.company_name, spec.financial_year
-        co_tok = [t for t in tokenize(co) if len(t) > 2 and t not in _CORP_WORDS]
+        fy = spec.financial_year
+        co_tok = self._name_tokens() or [t for t in tokenize(spec.company_name) if len(t) > 2]
         year_toks = _period_tokens(fy)
         cands: Dict[str, Tuple[int, str]] = {}
         ir_pages: List[str] = []
 
-        def add(url: str, text: str, bonus: int = 0) -> None:
-            sc = self._score(url, text, co_tok, year_toks) + bonus
+        def add(url: str, text: str, bonus: int = 0, trusted: bool = False) -> None:
+            sc = self._score(url, text, co_tok, year_toks, trusted) + bonus
             if sc > cands.get(url, (-9, ""))[0]:
                 cands[url] = (sc, text[:80])
 
-        queries = [f"{co} annual report {fy} pdf", f"{co} integrated annual report pdf",
-                   f"{co} investor relations annual reports", f"{co} annual report {fy} download"]
+        queries = []
+        for co in self.names[:2]:
+            queries += [f"{co} annual report {fy} pdf", f"{co} integrated annual report pdf",
+                        f"{co} investor relations annual reports", f"{co} form 10-K {fy}"]
         for q in queries:
             for r in self.tools.web_search(q, max_results=8):
                 add(r["href"], r.get("title", "") + " " + r.get("body", ""))
@@ -478,7 +537,7 @@ class ReferenceIngestor:
             print(f"  [Ingest]   crawled {page} -> {len(links)} links")
             for href, anchor in links:
                 if href.lower().split("?")[0].endswith(".pdf") or "annual" in (href + anchor).lower():
-                    add(href, anchor, bonus=1)
+                    add(href, anchor, bonus=1, trusted=True)
 
         annual_signal = re.compile(r"annual|integrated[\s_-]*report|10-?k|20-?f|form[\s_-]*10|report", re.I)
         ranked = [(sc, u, t) for u, (sc, t) in cands.items()
@@ -498,7 +557,19 @@ class ReferenceIngestor:
     # ------------------------------------------------------ 3. web corpus
     def _web_corpus(self, spec: ReportInput) -> List[SourceDocument]:
         from concurrent.futures import ThreadPoolExecutor
-        co = spec.company_name
+        co = self.names[1] if len(self.names) > 1 else spec.company_name
+        
+        # Ingest Wikipedia article as a foundational authoritative reference
+        wiki_text = ""
+        for name_cand in [co, spec.company_name] + self.names:
+            wiki_text = self.tools.get_wikipedia_extract(name_cand)
+            if wiki_text and len(wiki_text.split()) > 200:
+                print(f"  [Ingest]   Wikipedia article found for '{name_cand}' ({len(wiki_text.split())} words)")
+                self.kb.add_document("wikipedia_corpus", f"Wikipedia: {name_cand}",
+                                     f"https://en.wikipedia.org/wiki/{name_cand.replace(' ', '_')}",
+                                     _html_to_pages(wiki_text, 400))
+                break
+
         topics = ["company overview history headquarters", "business segments products services",
                   "board of directors committees corporate governance", "annual financial results revenue profit",
                   "balance sheet cash flow financial statements", "management discussion and analysis outlook",
@@ -519,7 +590,7 @@ class ReferenceIngestor:
                 urls[u] = r.get("title", "") or dom
             if len(urls) >= settings.WEB_CORPUS_PAGES * 2:
                 break
-        if not urls:
+        if not urls and not wiki_text:
             print("  [Ingest]   web corpus: no pages found (search returned nothing).")
             return []
         print(f"  [Ingest]   fetching up to {settings.WEB_CORPUS_PAGES} of {len(urls)} candidate pages...")
@@ -534,10 +605,11 @@ class ReferenceIngestor:
                 continue
             self.kb.add_document("web_corpus", title[:90], u, _html_to_pages(text, 400))
             used.append(u)
-        if not used:
+        if not used and not wiki_text:
             return []
-        print(f"  [Ingest]   web corpus: {len(used)} pages indexed")
-        return [SourceDocument(doc_id="web_corpus", title=f"Public web sources ({len(used)} pages)", url="",
+        src_pages = len(used) + (1 if wiki_text else 0)
+        print(f"  [Ingest]   web corpus: {len(used)} web pages + {'Wikipedia' if wiki_text else ''} indexed")
+        return [SourceDocument(doc_id="web_corpus", title=f"Public web sources ({src_pages} pages)", url="",
                                kind="web_corpus", matches_requested_period=None, pages=0, urls=used)]
 
     # ------------------------------------------------------------ one document

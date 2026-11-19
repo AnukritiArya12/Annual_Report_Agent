@@ -75,6 +75,13 @@ class ResearchTools:
         results = self._raw_search(query, max_results)
         if not results and len(query.split()) > 5:          # retry with a shorter query
             results = self._raw_search(" ".join(query.split()[:5]), max_results)
+        if not results:                                     # resilient fallback: Wikipedia + Yahoo Finance
+            wiki_res = self.search_wikipedia(query, max_results=max_results)
+            if wiki_res:
+                results.extend(wiki_res)
+            if len(results) < max_results:
+                yfin_res = self.search_yahoo_finance(query, max_results=max_results - len(results))
+                results.extend(yfin_res)
         return results
 
     def _raw_search(self, q: str, max_results: int) -> List[Dict[str, str]]:
@@ -94,8 +101,73 @@ class ResearchTools:
                         return out
             except Exception as e:
                 self.last_search_error = str(e)[:200]
-                time.sleep(1.5)
+                time.sleep(1.0)
         return []
+
+    def search_wikipedia(self, q: str, max_results: int = 5) -> List[Dict[str, str]]:
+        """Search Wikipedia API for company overviews, financials, subsidiaries, and corporate data."""
+        try:
+            url = "https://en.wikipedia.org/w/api.php"
+            params = {"action": "query", "list": "search", "srsearch": q, "format": "json", "utf8": 1}
+            headers = {"User-Agent": "AnnualReportAgent/1.0 (academic/research; contact@example.com)"}
+            r = requests.get(url, params=params, headers=headers, timeout=12)
+            results = []
+            if r.ok:
+                for item in r.json().get("query", {}).get("search", [])[:max_results]:
+                    title = item.get("title", "")
+                    snippet = re.sub(r"<[^>]+>", "", item.get("snippet", ""))
+                    t_slug = title.replace(" ", "_")
+                    href = f"https://en.wikipedia.org/wiki/{t_slug}"
+                    results.append({"title": title, "href": href, "body": snippet})
+            return results
+        except Exception as e:
+            self.last_search_error = f"Wikipedia search: {e}"
+            return []
+
+    def get_wikipedia_extract(self, title: str) -> str:
+        """Fetch full plain text extract of a Wikipedia article."""
+        try:
+            url = "https://en.wikipedia.org/w/api.php"
+            params = {"action": "query", "prop": "extracts", "explaintext": 1, "titles": title, "format": "json"}
+            headers = {"User-Agent": "AnnualReportAgent/1.0 (academic/research; contact@example.com)"}
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            if r.ok:
+                pages = r.json().get("query", {}).get("pages", {})
+                for pid, p in pages.items():
+                    if "extract" in p:
+                        return p["extract"]
+            return ""
+        except Exception:
+            return ""
+
+    def search_yahoo_finance(self, q: str, max_results: int = 5) -> List[Dict[str, str]]:
+        """Search Yahoo Finance API for ticker, legal name, sector, and investor relations news."""
+        try:
+            url = "https://query2.finance.yahoo.com/v1/finance/search"
+            headers = {"User-Agent": _UA}
+            r = requests.get(url, params={"q": q, "newsCount": max_results}, headers=headers, timeout=12)
+            results = []
+            if r.ok:
+                data = r.json()
+                for quote in data.get("quotes", [])[:max_results]:
+                    sym = quote.get("symbol", "")
+                    sname = quote.get("shortname") or quote.get("longname") or sym
+                    exch = quote.get("exchange", "")
+                    sec = quote.get("sector", "")
+                    ind = quote.get("industry", "")
+                    body = f"Symbol: {sym} | Exchange: {exch} | Sector: {sec} | Industry: {ind}"
+                    href = f"https://finance.yahoo.com/quote/{sym}"
+                    results.append({"title": f"{sname} ({sym})", "href": href, "body": body})
+                for n in data.get("news", [])[:max_results]:
+                    title = n.get("title", "")
+                    link = n.get("link", "")
+                    pub = n.get("publisher", "Yahoo Finance")
+                    if link and title:
+                        results.append({"title": f"{title} [{pub}]", "href": link, "body": title})
+            return results[:max_results]
+        except Exception as e:
+            self.last_search_error = f"Yahoo Finance search: {e}"
+            return []
 
     # --------------------------------------------------------------- fetching
     def scrape_url(self, url: str, max_chars: int = 6000) -> str:
@@ -205,12 +277,14 @@ class ResearchTools:
         """Download a PDF (size-capped). Returns the local path or None if it is not a real PDF."""
         os.makedirs(dest_dir, exist_ok=True)
         name = re.sub(r"[^A-Za-z0-9]+", "_", url.split("?")[0])[-80:].strip("_") or "document"
-        path = os.path.join(dest_dir, name if name.lower().endswith("pdf") else name + ".pdf")
+        name = re.sub(r"_?pdf$", "", name, flags=re.I) or "document"
+        path = os.path.join(dest_dir, name + ".pdf")          # always a real .pdf name (it used to end in '_pdf')
         if os.path.exists(path) and os.path.getsize(path) > 1024:
             return path
         limit = settings.MAX_DOWNLOAD_MB * 1024 * 1024
         try:
-            with requests.get(url, headers={"User-Agent": _UA}, timeout=60, stream=True) as r:
+            ua = settings.SEC_USER_AGENT if "sec.gov" in url else _UA      # SEC blocks browser-like agents
+            with requests.get(url, headers={"User-Agent": ua}, timeout=60, stream=True) as r:
                 r.raise_for_status()
                 size, first = 0, True
                 with open(path, "wb") as f:

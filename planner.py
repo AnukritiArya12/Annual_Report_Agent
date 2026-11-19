@@ -185,9 +185,74 @@ Each chapter uses this node shape (plus est_pages, chapter_id, rationale): {NODE
         data = self._ask_json(system, user)
         if isinstance(data, list):
             data = {"chapters": data}
-        if not data.get("chapters"):
+        chaps = data.get("chapters") or []
+        chaps = self._ensure_statutory_completeness(chaps, profile, spec)
+        if not chaps:
             raise RuntimeError("Planner returned no chapters")
+        data["chapters"] = chaps
         return data
+
+    @staticmethod
+    def _ensure_statutory_completeness(chapters: List[dict], profile: CompanyProfile, spec: ReportInput) -> List[dict]:
+        """Ensure the planned chapters encompass the complete statutory annual report lifecycle."""
+        titles_lower = " ".join(str(c.get("title", "")).lower() for c in chapters)
+        
+        statutory_templates = [
+            ("Corporate Overview & Strategic Blueprint", "corporate_overview", "narrative", 6,
+             "Company profile, history, global presence, core values, and value creation model",
+             ["company overview global operations", "business model value creation"]),
+            ("Leadership & Strategic Addresses", "leadership_review", "message", 4,
+             "Chairman's statement and CEO strategic address to shareholders on performance, headwinds, and capital allocation",
+             ["chairman message letter to shareholders", "CEO review strategic priorities"]),
+            ("Management Discussion and Analysis", "management_discussion_analysis", "narrative", 12,
+             "Macroeconomic operating environment, segment-by-segment operational review, financial performance analysis, and strategic outlook",
+             ["management discussion analysis segment revenue", "operational review operating margin"]),
+            ("Enterprise Risk Management & Risk Register", "enterprise_risk_management", "narrative", 6,
+             "Risk governance framework, risk matrix, principal strategic, operational, financial, cybersecurity and climate risks, with mitigation strategies",
+             ["risk factors enterprise risk management", "principal risks cyber geopolitical climate"]),
+            ("Corporate Governance Report", "corporate_governance_report", "governance", 10,
+             "Board composition, independence, skill matrix, board committees (Audit, Nomination & Remuneration, Stakeholder Relationship), director remuneration, and meeting attendance",
+             ["corporate governance report board of directors", "board committees audit remuneration"]),
+            ("Board's Report & Statutory Disclosures", "boards_report_statutory", "governance", 8,
+             "Directors' statutory report, secretarial audit, internal financial controls, dividend recommendation, vigil mechanism, and compliance certifications",
+             ["directors report statutory disclosures", "secretarial audit internal financial controls"]),
+            ("Human Capital & Workplace Culture", "human_capital_resources", "narrative", 5,
+             "Workforce demographics, talent retention, diversity, equity and inclusion (DEI), learning & development, and employee health and safety",
+             ["employee headcount attrition diversity", "human capital learning health safety"]),
+            ("Sustainability & ESG Disclosures", "sustainability_esg_disclosures", "sustainability", 8,
+             "ESG strategy, net zero roadmap, environmental stewardship (Scope 1, 2, 3 emissions, energy, water), social responsibility/CSR, and responsible business governance (BRSR/GRI/TCFD)",
+             ["sustainability report BRSR ESG emissions", "CSR initiatives carbon neutrality"]),
+            ("Consolidated Financial Statements", "consolidated_financial_statements", "financial_statement", 15,
+             "Independent Auditor's Report, Consolidated Balance Sheet, Consolidated Statement of Profit and Loss, Consolidated Statement of Cash Flows, and Statement of Changes in Equity",
+             ["consolidated balance sheet statement profit loss", "cash flow statement changes in equity"]),
+            ("Notes to Consolidated Financial Statements", "notes_to_financial_statements", "notes_to_accounts", 14,
+             "Significant accounting policies, segment reporting disclosures, related party disclosures, tax disclosures, contingencies, commitments, and financial risk management",
+             ["notes to consolidated financial statements accounting policies", "segment reporting related party disclosures"]),
+            ("General Shareholder & Investor Information", "shareholder_information", "investor_information", 4,
+             "Shareholding pattern, market capitalization history, AGM notice and key dates, registrar & transfer agent, investor grievance mechanism, and listing contacts",
+             ["shareholding pattern promoters public", "annual general meeting notice investor relations"])
+        ]
+        
+        result = list(chapters)
+        have_text = titles_lower
+        for title, ch_id, kind, est_pages, what_to_cover, queries in statutory_templates:
+            key_words = title.lower().split()
+            matched = any(kw in have_text for kw in key_words if len(kw) > 4)
+            if not matched or len(result) < 8:
+                if not any(c.get("chapter_id") == ch_id or c.get("title") == title for c in result):
+                    result.append({
+                        "chapter_id": ch_id,
+                        "title": title,
+                        "est_pages": est_pages,
+                        "rationale": f"Statutory annual reporting standard for {profile.country or 'listed companies'}",
+                        "what_to_cover": what_to_cover,
+                        "kind": kind,
+                        "search_queries": [f"{profile.company_name} {q} {spec.financial_year}" for q in queries],
+                        "depends_on": [],
+                        "validation_criteria": [f"Must detail {what_to_cover[:80]} with tabular presentation where disclosed"]
+                    })
+                    have_text += " " + title.lower()
+        return result
 
     def _critic_pass(self, spec, profile, chapters: List[dict]) -> List[dict]:
         toc = "\n".join(f"{i+1}. {c.get('title')} ({c.get('kind','')}, ~{c.get('est_pages','?')} pages)"
@@ -241,15 +306,65 @@ table of contents shows them; otherwise use what this kind of company and jurisd
 Sub-parts must not repeat each other: each owns a distinct slice of the content.
 Return JSON: {{"subsections": [ {NODE_SHAPE} ]}}"""
         print(f"[Planner] Splitting '{node['title']}' (~{int(words)} words) into {n_min}-{n_max} parts...", flush=True)
+        subs = []
         try:
             data = self._ask_json(system, user)
+            raw_subs = data.get("subsections") if isinstance(data, dict) else data
+            subs = [s for s in (raw_subs or []) if isinstance(s, dict) and s.get("title")]
         except QuotaExhausted:
             raise
         except Exception as e:
-            print(f"[Planner] Could not split '{node['title']}' ({e}); keeping it as one section.")
-            return []
-        subs = data.get("subsections") if isinstance(data, dict) else data
-        subs = [s for s in (subs or []) if isinstance(s, dict) and s.get("title")]
+            print(f"[Planner] LLM split for '{node['title']}' ({e}); generating structured sub-sections.")
+
+        if len(subs) < 2 and words > settings.LEAF_MAX_WORDS:
+            t_low = node["title"].lower()
+            if "financial statement" in t_low or "balance sheet" in t_low:
+                sub_names = ["Independent Auditor's Report", "Consolidated Balance Sheet",
+                             "Consolidated Statement of Profit and Loss", "Consolidated Statement of Cash Flows",
+                             "Consolidated Statement of Changes in Equity"]
+                k = "financial_statement"
+            elif "governance" in t_low:
+                sub_names = ["Board Composition and Independence", "Board Committees and Mandates",
+                             "Director Remuneration and Governance Policies"]
+                k = "governance"
+            elif "risk" in t_low:
+                sub_names = ["Risk Management Framework & Governance", "Principal Enterprise & Operational Risks",
+                             "Cybersecurity, Climate and Emerging Risks"]
+                k = "narrative"
+            elif "sustainab" in t_low or "esg" in t_low or "brsr" in t_low:
+                sub_names = ["ESG Strategy and Sustainability Commitments", "Environmental Stewardship and GHG Emissions",
+                             "Social Responsibility and Community Impact"]
+                k = "sustainability"
+            elif "management discussion" in t_low or "md&a" in t_low or "operations" in t_low:
+                sub_names = ["Macroeconomic Environment & Industry Trends", "Segment Operations and Business Performance",
+                             "Financial Performance and Margin Analysis", "Strategic Outlook and Growth Priorities"]
+                k = "narrative"
+            elif "note" in t_low:
+                sub_names = ["Significant Accounting Policies", "Segment Reporting Disclosures",
+                             "Related Party Transactions and Contingent Liabilities"]
+                k = "notes_to_accounts"
+            elif "leadership" in t_low or "message" in t_low or "letter" in t_low:
+                sub_names = ["Chairman's Statement to Shareholders", "Chief Executive Officer's Strategic Review"]
+                k = "message"
+            elif "shareholder" in t_low or "investor" in t_low:
+                sub_names = ["Shareholding Pattern and Market Capitalization", "Annual General Meeting Notice and Contacts"]
+                k = "investor_information"
+            else:
+                sub_names = [f"{node['title']} - Overview and Operational Framework",
+                             f"{node['title']} - Key Metrics, Performance and Performance Drivers",
+                             f"{node['title']} - Statutory Governance and Future Outlook"]
+                k = node.get("kind", "narrative")
+
+            subs = [{
+                "title": name,
+                "what_to_cover": f"Detailed coverage of {name} for {profile.company_name} ({spec.financial_year})",
+                "kind": k,
+                "weight": 1.0,
+                "search_queries": [f"{profile.company_name} {name} {spec.financial_year}"],
+                "depends_on": [],
+                "validation_criteria": [f"Detail {name} with data tables where available"]
+            } for name in sub_names]
+
         print(f"[Planner]   '{node['title']}' -> {len(subs)} parts", flush=True)
         return subs
 
