@@ -27,8 +27,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import approvals
 from config import get_llm, settings
 from schemas import ReportInput, SourceDocument
+from skills import CompanyIntelligenceSkill
 from tools import ResearchTools, rows_to_markdown
 from utils import extract_json, slug, tokenize
 
@@ -310,6 +312,7 @@ class ReferenceIngestor:
         self.contents: Dict[str, str] = {}     # doc_id -> table-of-contents text of that document
         self.names: List[str] = []             # every name the company is known by (brand, legal name, parent)
         self.ticker = ""
+        self.excluded: List[str] = []          # human-supplied names (subsidiaries / look-alikes) that must never be used
         os.makedirs(self.dir, exist_ok=True)
 
     # --------------------------------------------------------- entity resolution
@@ -317,7 +320,10 @@ class ReferenceIngestor:
         """'Google' files nothing; its parent 'Alphabet Inc.' does. Ask which legal entity publishes the report."""
         self.names = [spec.company_name]
         try:
-            system = "You identify which legal entity publishes a company's annual report. Return ONLY JSON."
+            system = (
+                f"{CompanyIntelligenceSkill.get_instructions()}\n\n"
+                "You identify which legal entity publishes a company's annual report. Return ONLY JSON."
+            )
             user = (f'Name given by the user: "{spec.company_name}" (country: {spec.country or "unknown"}).\n'
                     "If this is a brand, product or subsidiary, give the listed parent / reporting entity that files the "
                     'annual report. Return JSON: {"legal_name": "", "ticker": "", "also_known_as": []}. '
@@ -336,6 +342,35 @@ class ReferenceIngestor:
         except Exception as e:                 # quota errors etc. surface later, in planning, with a clear message
             print(f"  [Ingest] Entity lookup skipped ({str(e)[:80]})")
 
+    def _confirm_entity(self, spec: ReportInput) -> None:
+        """HUMAN CHECKPOINT 1 - confirm WHICH company this is before a single document is searched.
+        The LLM's guess of legal name / ticker is the root of every later search, so a wrong guess here
+        would put another company's documents into the report."""
+        legal = self.names[1] if len(self.names) > 1 else spec.company_name
+        vals, _ = approvals.edit_fields(
+            "entity", "STEP 1 - CONFIRM THE COMPANY (every search starts from these names)",
+            {"legal_name": legal, "ticker": self.ticker,
+             "also_known_as": ", ".join(self.names[2:]), "exclude": ""},
+            info=[f"You asked for : {spec.company_name} | country: {spec.country or '-'} | "
+                  f"period: {spec.financial_year} | scope: {spec.reporting_scope}",
+                  "legal_name    = the entity that really publishes the report (e.g. 'Google' -> 'Alphabet Inc.')",
+                  "ticker        = stock ticker used to find the SEC filing (empty if not US-listed)",
+                  "also_known_as = other names of the SAME company, comma separated",
+                  "exclude       = subsidiaries / sister or look-alike companies whose documents must NEVER be used"])
+        names = [spec.company_name]
+        for n in [vals["legal_name"]] + [x.strip() for x in vals["also_known_as"].split(",")]:
+            n = n.strip()
+            if n and n.lower() not in [x.lower() for x in names]:
+                names.append(n)
+        self.names = names
+        self.ticker = vals["ticker"].strip().upper()
+        self.excluded = [x.strip() for x in vals["exclude"].split(",") if x.strip()]
+        approvals.set_identity(self.names, self.excluded)       # used later by the writer guards and the final review
+
+    def _is_excluded(self, text: str) -> bool:
+        low = (text or "").lower()
+        return any(x.lower() in low for x in self.excluded)
+
     def _name_tokens(self) -> List[str]:
         toks: List[str] = []
         for n in self.names:
@@ -348,6 +383,7 @@ class ReferenceIngestor:
     def ingest(self, spec: ReportInput) -> List[SourceDocument]:
         self._check_search(spec)
         self._resolve_entity(spec)
+        self._confirm_entity(spec)                      # HUMAN CHECKPOINT 1
         docs: List[SourceDocument] = []
         for src in spec.source_documents:                              # optional manual override
             d = self._ingest_one(src, spec, kind="user_supplied", url_ok=True)
@@ -363,6 +399,16 @@ class ReferenceIngestor:
             print("  [Ingest] Strategy 3/3: broad public web corpus (no annual report could be downloaded)")
             docs = self._web_corpus(spec)
         docs.sort(key=lambda d: (not bool(d.matches_requested_period), -d.pages))
+        if docs:
+            doc_lines = [f"{d.title} ({d.kind}, ~{d.pages} pages) -> {d.url or d.local_path}" for d in docs]
+            approvals.confirm(
+                "sources_verified",
+                "STEP 1B - VERIFY SOURCES BELONG STRICTLY TO THIS COMPANY",
+                [f"Reporting Company: {spec.company_name} | Target Period: {spec.financial_year}",
+                 "Verify that the documents below belong strictly to this company (not a competitor, look-alike, or external entity):"]
+                + doc_lines,
+                default=True
+            )
         return docs
 
     def _check_search(self, spec: ReportInput) -> None:
@@ -424,6 +470,19 @@ class ReferenceIngestor:
         print(f"  [Ingest]   using {form} for period ending {rep} (filed {filed})"
               f"{'' if matches_period else '  - requested period not found, using the latest annual filing'}")
 
+        lines = [f"Registrant : {best['title']}  (ticker {best.get('ticker', '?')}, CIK {cik10})",
+                 f"Searched for: {', '.join(self.names)}" + (f"  | ticker {self.ticker}" if self.ticker else ""),
+                 f"Filing     : {form}, period ending {rep}, filed {filed}",
+                 f"Link       : {url}",
+                 f"Requested  : {spec.financial_year}  -> "
+                 + ("period MATCHES" if matches_period else "NOT FOUND - this is only the latest annual filing")]
+        if self._is_excluded(best["title"]):
+            lines.append("WARNING: registrant name matches your 'exclude' list")
+        if not approvals.confirm("edgar", "STEP 2 - IS THIS THE SEC FILING OF YOUR COMPANY?", lines,
+                                 default=matches_period and not self._is_excluded(best["title"])):
+            print("  [Ingest]   SEC filing rejected by you -> trying other sources")
+            return []
+        approvals.add_approved_urls([url])
         text = self.tools.fetch_html_structured(url, headers=hdr, max_chars=2_500_000, timeout=120)
         out: List[SourceDocument] = []
         if len(text.split()) > 3000:
@@ -544,6 +603,18 @@ class ReferenceIngestor:
                   if sc >= 5 and u.lower().split("?")[0].endswith(".pdf") and annual_signal.search(u + " " + t)]
         ranked.sort(reverse=True)
         print(f"  [Ingest]   {len(ranked)} PDF candidates" + (f"; best: {ranked[0][1]}" if ranked else ""))
+        ranked = [r for r in ranked if not self._is_excluded(r[1] + " " + r[2])]
+        if ranked:                                                        # HUMAN CHECKPOINT 3a
+            top = ranked[:8]
+            keep = approvals.choose(
+                "pdf_select", "STEP 3 - WHICH OF THESE PDFs IS THE REAL REPORT OF YOUR COMPANY?",
+                [(f"[score {sc}] {(text or '(no title)')[:90]}\n          {url}", url) for sc, url, text in top],
+                default_ids=[u for _, u, _ in top[:settings.MAX_REFERENCE_DOCS]],
+                intro=[f"Company: {self.names[0]} / {', '.join(self.names[1:]) or '-'} | period: {spec.financial_year}",
+                       "Keep ONLY reports published by this company itself (not a peer, parent or subsidiary)."])
+            ranked = [r for r in top if r[1] in keep]
+            if not ranked:
+                print("  [Ingest]   you rejected all PDF candidates -> falling back to other sources")
         docs: List[SourceDocument] = []
         for sc, url, text in ranked[:8]:
             if len(docs) >= settings.MAX_REFERENCE_DOCS:
@@ -565,6 +636,12 @@ class ReferenceIngestor:
             wiki_text = self.tools.get_wikipedia_extract(name_cand)
             if wiki_text and len(wiki_text.split()) > 200:
                 print(f"  [Ingest]   Wikipedia article found for '{name_cand}' ({len(wiki_text.split())} words)")
+                if not approvals.confirm(                                  # HUMAN CHECKPOINT 4a
+                        f"wiki:{name_cand}", "STEP 4a - IS THIS THE WIKIPEDIA ARTICLE OF YOUR COMPANY?",
+                        [f"Article : {name_cand}", f"Looking for: {', '.join(self.names)}",
+                         f"Starts with: {re.sub(chr(10) + '+', ' ', wiki_text[:350])}"], default=True):
+                    wiki_text = ""
+                    continue
                 self.kb.add_document("wikipedia_corpus", f"Wikipedia: {name_cand}",
                                      f"https://en.wikipedia.org/wiki/{name_cand.replace(' ', '_')}",
                                      _html_to_pages(wiki_text, 400))
@@ -595,6 +672,13 @@ class ReferenceIngestor:
             return []
         print(f"  [Ingest]   fetching up to {settings.WEB_CORPUS_PAGES} of {len(urls)} candidate pages...")
         items = list(urls.items())[: settings.WEB_CORPUS_PAGES * 2]
+        items = [(u, ti) for u, ti in items if not self._is_excluded(u + " " + ti)]
+        keep = approvals.choose(                                              # HUMAN CHECKPOINT 4b
+            "web_select", f"STEP 4b - WHICH WEB PAGES MAY BE USED AS SOURCES FOR '{self.names[0]}'?",
+            [(f"{(ti or '(no title)')[:80]}\n          {u}", u) for u, ti in items],
+            default_ids=[u for u, _ in items],
+            intro=["Remove pages about other companies, subsidiaries, or unrelated topics (e.g. 'none' to use no web pages)."])
+        items = [(u, ti) for u, ti in items if u in keep]
         with ThreadPoolExecutor(max_workers=6) as ex:
             texts = list(ex.map(lambda kv: self.tools.fetch_html_structured(kv[0], max_chars=60000, timeout=30), items))
         used: List[str] = []
@@ -607,6 +691,7 @@ class ReferenceIngestor:
             used.append(u)
         if not used and not wiki_text:
             return []
+        approvals.add_approved_urls(used)
         src_pages = len(used) + (1 if wiki_text else 0)
         print(f"  [Ingest]   web corpus: {len(used)} web pages + {'Wikipedia' if wiki_text else ''} indexed")
         return [SourceDocument(doc_id="web_corpus", title=f"Public web sources ({src_pages} pages)", url="",
@@ -652,7 +737,25 @@ class ReferenceIngestor:
             title = (title_hint or os.path.basename(local)).strip()
             if fy_detected:
                 title = f"{title} [{fy_detected}]"
+            if kind != "user_supplied":                                       # HUMAN CHECKPOINT 3b
+                names_low = [n.lower() for n in self.names] or [spec.company_name.lower()]
+                mentions = any(n in head for n in names_low) or any(t_ in head for t_ in self._name_tokens())
+                hit_ex = [x for x in self.excluded if x.lower() in head]
+                first = re.sub(r"\s+", " ", pages[0][1])[:260] if pages else ""
+                info = [f"Document : {title}", f"Source   : {src}", f"Pages    : {n_pages}",
+                        f"Period   : detected '{fy_detected or 'unknown'}' vs requested '{spec.financial_year}' -> "
+                        + ("MATCH" if matches else "MAY NOT MATCH"),
+                        f"Company name on first pages: {'yes' if mentions else 'NO  <-- check carefully'}",
+                        f"Starts with: {first}"]
+                if hit_ex:
+                    info.append(f"WARNING: first pages mention your excluded name(s): {', '.join(hit_ex)}")
+                if not approvals.confirm(f"pdf_doc:{src}", "STEP 3b - IS THIS DOWNLOADED DOCUMENT CORRECT?", info,
+                                         default=bool(matches) and mentions and not hit_ex):
+                    print(f"  [Ingest]   rejected by you: {src[:90]}")
+                    return None
             added = self.kb.add_document(doc_id, title, src if is_url else "", pages)
+            if is_url:
+                approvals.add_approved_urls([src])
             self.contents[doc_id] = contents_text_from(toc, pages)
             print(f"  [Ingest]   OK {title}: {n_pages} pages, {added} chunks"
                   f"{'' if matches else '  (period may differ from requested)'}")

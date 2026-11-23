@@ -16,9 +16,14 @@ import shutil
 import sys
 import threading
 import time
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
+import approvals
 from agent import GenericTaskExecutionAgent, RunContext
 from assembler import ReportAssembler
 from config import QuotaExhausted, active_model_label, get_llm, settings
@@ -26,7 +31,7 @@ from knowledge import KnowledgeBase, ReferenceIngestor
 from planner import DynamicPlanningEngine
 from schemas import (ExecutionState, ReportInput, TaskDefinition, TaskOutput, TaskStatus, ValidationResult)
 from tools import ResearchTools
-from utils import slug, word_count
+from utils import SPARSE_MARK, foreign_entities, slug, word_count
 from validator import DynamicValidator
 
 
@@ -36,6 +41,7 @@ class MainOrchestrator:
         self.resume = resume
         self.plan_only = plan_only
         os.makedirs(run_dir, exist_ok=True)
+        approvals.configure(run_dir, auto=getattr(settings, "AUTO_APPROVE", False), reset=not resume)
         self.tools = ResearchTools(run_dir=run_dir)
         self.kb_path = os.path.join(run_dir, "kb.json")
         self.print_lock = threading.Lock()
@@ -93,6 +99,15 @@ class MainOrchestrator:
             print("Run again WITHOUT --plan-only (add --resume to reuse this plan) to write the report.")
             return ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
 
+        # ---- HUMAN CHECKPOINT 6: approve the outline before the (expensive) writing starts
+        if not approvals.confirm("plan", "STEP 2b - APPROVE THE REPORT OUTLINE BEFORE WRITING",
+                                 [f"{len(blueprint.chapters)} chapters, {len(blueprint.tasks)} sections (full list printed above, "
+                                  "also in outline.txt)",
+                                  "Say 'n' to stop; then edit blueprint.json if you want and run again with --resume."],
+                                 default=True, remember_no=False):
+            print("\nStopped before writing. Edit blueprint.json if needed, then run again with --resume.")
+            return ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
+
         # ---- 3. write + validate
         calls = len(blueprint.tasks) * (1 + (1 if settings.VALIDATE_WITH_LLM else 0))
         print(f"\n[Budget] Writing needs about {calls} LLM calls (more if sections are revised or expanded). "
@@ -102,6 +117,8 @@ class MainOrchestrator:
         self.ctx = RunContext(blueprint=blueprint, kb=kb, tools=self.tools,
                               draft_dir=os.path.join(self.run_dir, "drafts"))
         self.validator = DynamicValidator()
+        _names, _excluded = approvals.identity()
+        self.validator.set_company(_names or [blueprint.company_profile.company_name], _excluded)
         state = ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
         done = 0
         total = len(blueprint.tasks)
@@ -136,6 +153,26 @@ class MainOrchestrator:
                     done += 1
                     print(f"  [Progress {done}/{total}] {' > '.join(t.path)}")
 
+        # ---- HUMAN CHECKPOINT: other-company content in the written sections
+        self._entity_review(blueprint, state)
+
+        # ---- summary stats
+        words = sum(word_count(o.markdown_content) for o in state.task_outputs.values())
+        failed = [blueprint.get_task(i).title for i, o in state.task_outputs.items() if o.status == TaskStatus.FAILED]
+        flagged = [blueprint.get_task(i).title for i, v in state.validation_results.items()
+                   if not v.is_valid and state.task_outputs[i].status != TaskStatus.FAILED]
+        sparse_secs = [blueprint.get_task(i).title for i, o in state.task_outputs.items() if o.sparse]
+
+        # ---- HUMAN CHECKPOINT 3: approve final report before export
+        if not approvals.confirm("final_review", "STEP 4 - APPROVE COMPLETED REPORT FOR PUBLICATION & EXPORT",
+                                 [f"Company: {blueprint.company_profile.company_name} | {spec.financial_year}",
+                                  f"Generated: {len(blueprint.chapters)} chapters, {total} sections (~{words:,} words, ~{round(words / settings.WORDS_PER_PAGE)} pages)",
+                                  f"Failed sections: {len(failed)} | Open review notes: {len(flagged)} | Undisclosed gaps: {len(sparse_secs)}",
+                                  "Confirm to assemble and generate PDF & DOCX reports."],
+                                 default=True, remember_no=False):
+            print("\nExport paused by user. Finished sections and blueprint are preserved; run again with --resume to finalize.")
+            return state
+
         # ---- 4. assemble
         print("\n>>> STEP 4: ASSEMBLY & EXPORT")
         assembler = ReportAssembler(tools=self.tools)
@@ -152,13 +189,6 @@ class MainOrchestrator:
             except Exception as e:
                 print(f"  [Assembler] {name} export failed ({e}); the Markdown file is complete.")
         state.final_report_path = pdf_file if os.path.exists(pdf_file) else md_file
-
-        # ---- summary
-        words = sum(word_count(o.markdown_content) for o in state.task_outputs.values())
-        failed = [blueprint.get_task(i).title for i, o in state.task_outputs.items() if o.status == TaskStatus.FAILED]
-        flagged = [blueprint.get_task(i).title for i, v in state.validation_results.items()
-                   if not v.is_valid and state.task_outputs[i].status != TaskStatus.FAILED]
-        sparse_secs = [blueprint.get_task(i).title for i, o in state.task_outputs.items() if o.sparse]
         summary = {
             "company": blueprint.company_profile.company_name, "financial_year": spec.financial_year,
             "target_pages": blueprint.target_pages, "chapters": len(blueprint.chapters), "tasks": total,
@@ -216,6 +246,101 @@ class MainOrchestrator:
                   "The agent will not generate placeholder text without a working model.")
             sys.exit(1)
 
+    # ------------------------------------------------------------------ human review of other-company content
+    def _entity_review(self, blueprint, state: ExecutionState) -> None:
+        """After ALL sections are written (never inside the parallel workers), show the human every organisation
+        that appears in the text but is not this company and not in the evidence. The human decides per NAME
+        (allowed / forbidden - asked once, remembered) and per SECTION (regenerate / withdraw)."""
+        co = blueprint.company_profile.company_name
+        names, excluded = approvals.identity()
+        names = names or [co]
+        tasks = {t.task_id: t for t in blueprint.tasks}
+
+        def flags_of(tid: str) -> list:
+            out = state.task_outputs.get(tid)
+            if not out or out.status != TaskStatus.COMPLETED or out.sparse:
+                return []
+            fl = self.validator.entity_flags.get(tid)
+            if fl is None:        # section came from the draft cache: only the human's own lists can be applied
+                fl = foreign_entities(out.markdown_content, names, excluded, "", approvals.entity_statuses(),
+                                      check_evidence=False)
+            st = approvals.entity_statuses()
+            return [f for f in fl if st.get(f[1]) != "allowed"]
+
+        flagged = {tid: flags_of(tid) for tid in tasks}
+        flagged = {tid: fl for tid, fl in flagged.items() if fl}
+        print(f"\n>>> REVIEW: other-company content check ({len(flagged)} of {len(tasks)} sections flagged)")
+        if not flagged:
+            return
+        for tid, fl in flagged.items():
+            print(f"  - {' > '.join(tasks[tid].path)}: " + "; ".join(f[0] for f in fl[:4]))
+        if approvals.is_auto():
+            print("  [auto-approve] review skipped. Re-run without --auto-approve (and --resume) to review these.")
+            return
+
+        # ---- (a) one decision per distinct name
+        by_key: Dict[str, dict] = {}
+        for tid, fl in flagged.items():
+            for disp, key, why in fl:
+                e = by_key.setdefault(key, {"name": disp, "why": why, "tids": []})
+                e["tids"].append(tid)
+        for key, e in by_key.items():
+            if approvals.entity_statuses().get(key):
+                continue
+            lines = [f"Why flagged: {e['why']}", f"Appears in {len(e['tids'])} section(s):"]
+            for tid in e["tids"][:3]:
+                text = state.task_outputs[tid].markdown_content
+                pos = text.lower().find(e["name"].lower().split()[0])
+                snip = text[max(0, pos - 70): pos + len(e["name"]) + 70].replace("\n", " ") if pos >= 0 else ""
+                lines.append(f"  - {' > '.join(tasks[tid].path)}: ...{snip}...")
+            choice = approvals.select_one(
+                f"entity:{key}", f"IS '{e['name']}' ALLOWED IN THIS REPORT OF {co.upper()}?", lines,
+                [("a", "allowed - a legitimate mention (auditor, regulator, customer, competitor, parent, own subsidiary)"),
+                 ("f", "forbidden - it must NOT appear in this report")], default="f")
+            approvals.set_entity_status(key, "allowed" if choice == "a" else "forbidden", e["name"])
+
+        # ---- (b) regenerate the sections that contain forbidden names
+        def bad_names(tid: str) -> List[str]:
+            st = approvals.entity_statuses()
+            return [f[0] for f in flags_of(tid) if st.get(f[1]) == "forbidden"]
+
+        todo = [tid for tid in tasks if bad_names(tid)]
+        if not todo:
+            print("  [Review] no section contains a forbidden name.")
+            return
+        keep = approvals.choose(
+            "entity_regen:" + ",".join(sorted(todo)), "REGENERATE THE SECTIONS THAT MENTION FORBIDDEN NAMES",
+            [(f"{' > '.join(tasks[tid].path)}   [{', '.join(bad_names(tid)[:3])}]", tid) for tid in todo],
+            default_ids=todo, intro=["Selected sections are rewritten once with the instruction to remove those names."])
+        for tid in keep:
+            task = tasks[tid]
+            fb = (f"Remove EVERY mention of: {', '.join(n.rstrip('.') for n in bad_names(tid))}. They are not part of {co}. Write only about "
+                  f"{co} using only evidence about it; if the evidence is missing say 'Not disclosed in the sources reviewed'.")
+            try:
+                out = GenericTaskExecutionAgent(self.ctx).execute_task(task, feedback=fb)
+                val = self.validator.validate_task_output(task, out, self.ctx.snapshot_texts())
+            except QuotaExhausted as e:
+                print(f"  [Quota] {e}\n  [Review] stopped; remaining sections keep their current text.")
+                break
+            state.task_outputs[tid], state.validation_results[tid] = out, val
+
+        # ---- (c) what still contains a forbidden name: withdraw the text (human confirms)
+        left = [tid for tid in tasks if bad_names(tid)]
+        if left and approvals.confirm(
+                "entity_withdraw:" + ",".join(sorted(left)), "WITHDRAW THE TEXT OF SECTIONS THAT STILL MENTION FORBIDDEN NAMES",
+                [f"{' > '.join(tasks[tid].path)}   [{', '.join(bad_names(tid)[:3])}]" for tid in left]
+                + ["They will be replaced by a short 'not available' notice (the draft file is overwritten)."],
+                default=True, remember_no=False):
+            for tid in left:
+                notice = (f"{SPARSE_MARK} The draft of this section mentioned organisations that are not part of this "
+                          f"report and was withdrawn after human review.*")
+                out = state.task_outputs[tid]
+                out.markdown_content, out.sparse, out.sources, out.word_count = notice, True, [], word_count(notice)
+                with open(os.path.join(self.ctx.draft_dir, f"{tid}.md"), "w", encoding="utf-8") as f:
+                    f.write(notice)
+                self.ctx.record(tid, notice)
+                self.validator.entity_flags[tid] = []
+
     def _process(self, task: TaskDefinition) -> Tuple[TaskOutput, ValidationResult]:
         agent = GenericTaskExecutionAgent(self.ctx)
         output = agent.execute_task(task)
@@ -248,6 +373,8 @@ def parse_arguments():
     p.add_argument("--workers", type=int, default=None, help="Parallel writing workers")
     p.add_argument("--low-quota", action="store_true",
                    help="Minimise LLM calls (free tiers): 1 worker, no LLM review, no revisions, larger sections")
+    p.add_argument("--auto-approve", action="store_true",
+                   help="Skip all human approval questions (accept the agent's own choices). Default: ask the human.")
     p.add_argument("--plan-only", action="store_true", help="Only design the structure, print the outline, then stop")
     p.add_argument("--resume", action="store_true", help="Reuse the saved plan, knowledge base and finished sections")
     a = p.parse_args()
@@ -262,6 +389,7 @@ def parse_arguments():
         print("[Low-quota mode] 1 worker, no LLM review/revisions/expansion, sections up to 1200 words.")
     if a.workers:
         settings.MAX_PARALLEL_WORKERS = a.workers
+    settings.AUTO_APPROVE = a.auto_approve
     return ReportInput(company_name=a.company, financial_year=a.fy, country=a.country, industry=a.industry,
                        reporting_scope=a.scope, extra_instructions=a.extra, target_pages=a.pages,
                        source_documents=a.pdf), a.resume, a.plan_only
@@ -274,4 +402,9 @@ if __name__ == "__main__":
         pass
     spec, resume, plan_only = parse_arguments()
     run_dir = os.path.abspath(os.path.join("runs", f"{slug(spec.company_name)}_{slug(spec.financial_year)}"))
-    MainOrchestrator(run_dir=run_dir, resume=resume, plan_only=plan_only).run(spec)
+    try:
+        MainOrchestrator(run_dir=run_dir, resume=resume, plan_only=plan_only).run(spec)
+    except approvals.ApprovalAborted as e:
+        print(f"\n[Approval] Run stopped: {e}. Your earlier answers are saved; "
+              "run again with --resume to continue where you left off.")
+        sys.exit(1)

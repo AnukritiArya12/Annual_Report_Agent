@@ -20,12 +20,13 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import approvals
 from config import QuotaExhausted, get_llm, settings
 from knowledge import KnowledgeBase
 from schemas import (EvidenceItem, ReportBlueprint, SourceDocument, TaskDefinition, TaskOutput, TaskStatus)
-from skills import get_style_guidance
+from skills import EvidenceGroundedWritingSkill, get_style_guidance
 from tools import ResearchTools
-from utils import SPARSE_MARK, clean_llm_text, digest, word_count
+from utils import SPARSE_MARK, chunk_foreign_reason, clean_llm_text, digest, word_count
 
 NOT_DISCLOSED = "Not disclosed in the sources reviewed"
 
@@ -163,6 +164,19 @@ class GenericTaskExecutionAgent:
             for ch, sc in self.ctx.kb.search(q, k=k):
                 if ch.chunk_id not in best or sc > best[ch.chunk_id][1]:
                     best[ch.chunk_id] = (ch, sc)
+        # GUARD: drop evidence chunks that are about another organisation (never shown to the writer)
+        names, excluded = approvals.identity()
+        names = names or [self.ctx.blueprint.company_profile.company_name]
+        statuses = approvals.entity_statuses()
+        dropped = 0
+        for cid in list(best):
+            ch = best[cid][0]
+            if chunk_foreign_reason(ch.text, names, excluded, statuses,
+                                    strict_org=ch.doc_id in ("web_corpus", "wikipedia_corpus")):
+                del best[cid]
+                dropped += 1
+        if dropped:
+            print(f"  [Guard] '{task.title}': dropped {dropped} evidence chunk(s) that are not about this company")
         # Sections that share the same top chunks write the same text. Chunks other sections already use are
         # down-weighted (not forbidden), so siblings draw on different parts of the source.
         penalise = task.kind != "financial_statement"
@@ -183,8 +197,14 @@ class GenericTaskExecutionAgent:
     def _web_evidence(self, task: TaskDefinition, start: int) -> List[EvidenceItem]:
         items: List[EvidenceItem] = []
         seen: List[str] = []
+        profile = self.ctx.blueprint.company_profile
+        co = profile.company_name
         for q in task.search_queries[:2]:
-            for r in self.ctx.tools.web_search(q, max_results=settings.MAX_SEARCH_RESULTS):
+            if co.lower() not in q.lower():                 # every live search must name the company
+                q = f"{co} {q}"
+            found = self.ctx.tools.web_search(q, max_results=settings.MAX_SEARCH_RESULTS)
+            # GUARD: only approved domains that also mention this company (no other company's pages)
+            for r in approvals.filter_web_results(found, co):
                 if r["href"] in seen:
                     continue
                 seen.append(r["href"])
@@ -262,18 +282,32 @@ class GenericTaskExecutionAgent:
 
     def _system_prompt(self, task: TaskDefinition) -> str:
         p = self.ctx.blueprint.company_profile
+        names, excluded = approvals.identity()
+        names = names or [p.company_name]
+        banned = list(dict.fromkeys(list(excluded) + approvals.forbidden_names()))
+        scope_rules = (
+            f"8. ENTITY SCOPE: this report is ONLY about {' / '.join(names)} and its own consolidated group. "
+            f"Never describe the operations, products, figures, strategy or history of any other company, and never write "
+            f"about a subsidiary as if it were a separate reporting entity. Mention other organisations (auditors, "
+            f"regulators, lenders, customers, competitors, parent) only when the EVIDENCE names them, and only as context "
+            f"for {p.company_name}. Never use your own background knowledge about any company: if the evidence does not "
+            f"say it, write 'Not disclosed in the sources reviewed'.\n")
+        if banned:
+            scope_rules += f"9. NEVER mention or use anything about: {', '.join(banned)} (not part of this report).\n"
         return (
+            f"{EvidenceGroundedWritingSkill.get_instructions()}\n\n"
             f"You are the Chief Financial Writer and Corporate Governance Analyst for the annual report of {p.company_name}. "
             f"You write ONE part of the report in the formal, authoritative voice of a publication-grade annual report, "
             f"tailored to the corporate laws, listing rules and accounting conventions of {p.country or 'its primary jurisdiction'}.\n"
             f"TRUTHFULNESS & FIDELITY RULES:\n"
             f"1. Ground all numbers, percentages, financial line items, dates, and names strictly in the provided EVIDENCE or earlier sections. Never fabricate financial figures.\n"
-            f"2. Provide thorough, substantive analysis. If specific proprietary figures are omitted from the evidence, provide comprehensive qualitative analysis of the operational strategy, policy framework, risk controls, and regulatory standards rather than writing repetitive '{NOT_DISCLOSED}' placeholders.\n"
+            f"2. Be thorough about what the EVIDENCE contains and explain it clearly. Where a point is missing from the evidence, say '{NOT_DISCLOSED}' once for that point and move on; do not fill the gap with general knowledge or generic statements.\n"
             f"3. Cite evidence inline as [E1], [E2]. Every reported figure must carry its currency, unit, and period. If evidence refers to another fiscal period, state the period explicitly.\n"
-            f"4. Tables: When numerical evidence is available, present structured Markdown tables with clean header rows and '| --- |' separators. Keep columns balanced.\n"
+            f"4. ZERO BLANK TABLE CELLS: When numerical or structured evidence is available, present structured Markdown tables with balanced columns, headers, and '| :--- |' separators. NEVER leave any table cell blank ('| |' or '|   |'). If a value is reported, output the exact value; if absent, enter 'Not Disclosed' or 'n/d'.\n"
             f"5. Scope & Structure: Stay inside this part's scope. Do not repeat what earlier parts already covered. Begin directly with this section's core content without introductory fluff or preamble.\n"
-            f"6. Depth & Length: Aim for about {task.target_words} words. Provide comprehensive, statutory-grade prose and detailed business context.\n"
+            f"6. Length: aim for about {task.target_words} words only if the evidence supports it; a shorter accurate section is better than padding.\n"
             f"7. Output ONLY the Markdown body. Do NOT start with the section's own title (it is rendered by the assembler). Use '####' sub-headings where useful.\n"
+            f"{scope_rules}"
             f"STYLE FOR THIS KIND OF PART ({task.kind}): {get_style_guidance(task.kind)}"
         )
 
@@ -368,7 +402,7 @@ EVIDENCE:
 
     @staticmethod
     def _clean_tables(body: str) -> str:
-        """Drop table rows whose values are all 'Not disclosed', shorten remaining N/D cells, drop empty tables."""
+        """Drop table rows whose values are all 'Not disclosed', ensure zero blank cells, shorten remaining N/D cells, drop empty tables."""
         nd_re = re.compile(r"^(not disclosed( in the sources reviewed)?|n/d|not available)\.?$", re.I)
         lines, out, i = body.split("\n"), [], 0
         while i < len(lines):
@@ -384,13 +418,17 @@ EVIDENCE:
             head, rows, kept, replaced = tbl[:sep + 1], tbl[sep + 1:], [], False
             for r in rows:
                 cells = [c.strip() for c in r.strip().strip("|").split("|")]
+                if not cells:
+                    continue
+                # CRITICAL: replace any completely empty cell with 'Not Disclosed' so zero cells are blank
+                cells = [c if c != "" else "Not Disclosed" for c in cells]
                 vals = cells[1:]
-                if vals and all(nd_re.match(c) or c == "" for c in vals) and any(nd_re.match(c) for c in vals):
+                if vals and all(nd_re.match(c) for c in vals):
                     continue                                                  # nothing real in this row
                 if any(nd_re.match(c) for c in vals):
                     cells = [cells[0]] + ["n/d" if nd_re.match(c) else c for c in vals]
                     replaced = True
-                    r = "| " + " | ".join(cells) + " |"
+                r = "| " + " | ".join(cells) + " |"
                 kept.append(r)
             if kept:
                 out += head + kept

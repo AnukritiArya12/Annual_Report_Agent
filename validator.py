@@ -9,17 +9,55 @@ from __future__ import annotations
 import re
 from typing import Dict, List
 
+import approvals
 from config import QuotaExhausted, get_llm, settings
 from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult
-from utils import extract_json, shingle_set, word_count
+from skills import REVIEW_GUIDANCE
+from utils import extract_json, foreign_entities, shingle_set, word_count
 
 
 class DynamicValidator:
     def __init__(self):
         self.llm = get_llm()
         self._shingles: Dict[str, set] = {}
+        self.names: List[str] = []                 # approved names of THE company (set by main via set_company)
+        self.excluded: List[str] = []
+        self.entity_flags: Dict[str, list] = {}    # task_id -> [(name, key, reason)] found in the latest draft
+
+    def set_company(self, names: List[str], excluded: List[str] = ()) -> None:
+        self.names = [n for n in names if n]
+        self.excluded = list(excluded)
+        self.entity_flags = {}
+
+    # ------------------------------------------------------- other-company content
+    def _foreign_entities(self, task: TaskDefinition, text: str, output: TaskOutput) -> List[str]:
+        """Organisations in the draft that are not this company and not in the evidence it was written from."""
+        if not self.names:
+            return []
+        evidence = " ".join(e.text for e in output.evidence_used)
+        flags = foreign_entities(text, self.names, self.excluded, evidence, approvals.entity_statuses())
+        self.entity_flags[task.task_id] = flags
+        if not flags:
+            return []
+        shown = "; ".join(f"{d} ({why})" for d, _, why in flags[:5])
+        return [f"The section mentions organisation(s) that are not part of this report: {shown}. This report is ONLY "
+                f"about {self.names[0]} (its own group). Delete every statement about other companies; use only "
+                f"facts from the evidence about {self.names[0]}; write 'Not disclosed in the sources reviewed' otherwise."]
 
     # ----------------------------------------------------------- programmatic
+    @staticmethod
+    def _blank_table_cells(text: str) -> List[str]:
+        """Verify that no Markdown table contains completely blank cells."""
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("|") and s.endswith("|"):
+                if re.match(r"^\|?[\s:\-|]+\|?$", s):
+                    continue
+                cells = [c.strip() for c in s.strip("|").split("|")]
+                if any(c == "" for c in cells):
+                    return ["Table contains blank cells ('| |'). Every cell must report grounded evidence or 'Not Disclosed'."]
+        return []
+
     @staticmethod
     def _ungrounded_numbers(text: str, output: TaskOutput) -> List[str]:
         evidence = " ".join(e.text for e in output.evidence_used).replace(",", "")
@@ -76,7 +114,9 @@ class DynamicValidator:
                           f"contains more material. Cover every point in 'what to cover' using the evidence.")
 
         issues += self._ungrounded_numbers(text, output)
+        issues += self._foreign_entities(task, text, output)
         issues += self._duplicates(task, text, completed_texts)
+        issues += self._blank_table_cells(text)
 
         for criterion in task.validation_criteria:
             if any(w in criterion.lower() for w in ("table", "matrix")):
@@ -97,7 +137,7 @@ class DynamicValidator:
     def _llm_review(self, task: TaskDefinition, output: TaskOutput, text: str) -> List[str]:
         evid = "\n".join(f"[{i+1}] {e.text[:350]}" for i, e in enumerate(output.evidence_used[:8]))
         system = ("You are a strict annual-report audit reviewer. Judge ONLY the two things asked. "
-                  "Return ONLY JSON: {\"verdict\": \"PASS\" | \"FAIL\", \"issues\": [\"...\"]}.")
+                  "Return ONLY JSON: {\"verdict\": \"PASS\" | \"FAIL\", \"issues\": [\"...\"]}.\n" + REVIEW_GUIDANCE)
         user = f"""Section: {task.title}
 Acceptance criteria:
 {chr(10).join('- ' + c for c in task.validation_criteria)}

@@ -23,11 +23,12 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
+import approvals
 from config import QuotaExhausted, get_llm, settings
 from knowledge import KnowledgeBase
 from schemas import (ChapterBlueprint, CompanyProfile, ReportBlueprint, ReportInput,
                      SourceDocument, TaskDefinition)
-from skills import SECTION_KINDS
+from skills import SECTION_KINDS, DynamicReportArchitectSkill, CompanyIntelligenceSkill
 from tools import ResearchTools
 from utils import extract_json, slug
 
@@ -75,8 +76,11 @@ class DynamicPlanningEngine:
                                     k=4, doc_ids=[d.doc_id for d in docs] or None):
             notes.append(f"[company report p.{ch.page}] {ch.text}")
 
-        system = ("You are a corporate intelligence analyst. Use ONLY the research notes. If something is not in "
-                  "the notes, leave it empty - never guess. Return ONLY a JSON object.")
+        system = (
+            f"{CompanyIntelligenceSkill.get_instructions()}\n\n"
+            "You are a corporate intelligence analyst. Use ONLY the research notes. If something is not in "
+            "the notes, leave it empty - never guess. Return ONLY a JSON object."
+        )
         user = f"""Company: {co}
 Country (given): {spec.country or 'unknown - infer from notes'}
 Industry (given): {spec.industry or 'unknown - infer from notes'}
@@ -105,8 +109,32 @@ disclosure rules that really apply to this company in its country), reporting_fr
             print(f"[Planner] Profile step failed ({e}); continuing with a minimal profile (no invented facts).")
             profile = CompanyProfile(company_name=co, country=spec.country, industry=spec.industry or "Unknown",
                                      official_sources=official[:5])
+        profile = self._confirm_profile(profile)                      # HUMAN CHECKPOINT 5
         print(f"[Planner] Profile: {profile.industry} | {profile.country} | {profile.reporting_framework or 'framework n/a'}")
         return profile
+
+    def _confirm_profile(self, profile: CompanyProfile) -> CompanyProfile:
+        """HUMAN CHECKPOINT 5 - the whole plan (chapters, regulations, segments) is built from this profile."""
+        join = lambda xs: ", ".join(xs)
+        fields = {"industry": profile.industry, "country": profile.country, "ticker_or_id": profile.ticker_or_id or "",
+                  "listing_status": profile.listing_status, "reporting_framework": profile.reporting_framework,
+                  "key_business_segments": join(profile.key_business_segments),
+                  "geographic_presence": join(profile.geographic_presence),
+                  "applicable_regulations": join(profile.applicable_regulations),
+                  "peer_competitors": join(profile.peer_competitors)}
+        vals, changed = approvals.edit_fields(
+            "profile", "STEP 5 - CONFIRM THE COMPANY PROFILE (the report structure is designed from it)", fields,
+            info=[f"Company: {profile.company_name}", f"Summary: {(profile.business_model_summary or '-')[:300]}"])
+        update: Dict[str, Any] = {}
+        for k in changed:                       # only edited fields are re-split; untouched ones keep their exact values
+            v = vals[k].strip()
+            if k in ("key_business_segments", "geographic_presence", "applicable_regulations", "peer_competitors"):
+                update[k] = [x.strip() for x in v.split(",") if x.strip()]
+            elif k == "ticker_or_id":
+                update[k] = v or None
+            else:
+                update[k] = v
+        return profile.model_copy(update=update) if update else profile
 
     @staticmethod
     def _coerce_profile(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -144,10 +172,12 @@ disclosure rules that really apply to this company in its country), reporting_fr
     # ------------------------------------------------------- 3. chapters + critic
     def _design_chapters(self, spec, profile, docs, structure_evidence) -> Dict[str, Any]:
         ref_pages = docs[0].pages if docs else 0
-        system = ("You are the Chief Report Architect of a top annual-report production house. You decide the "
-                  "complete table of contents of ONE company's annual report, front cover to back cover, "
-                  "tailored to that company, its country's law and listing rules, its industry and its reporting "
-                  "standard. Return ONLY valid JSON.")
+        system = (
+            f"{DynamicReportArchitectSkill.get_instructions()}\n\n"
+            "You are the Chief Report Architect. Design the COMPLETE start-to-end table of contents of ONE company's "
+            "annual report, front cover to back cover, tailored strictly to that company, its country's law and listing rules, "
+            "its specific business segments, industry, and accounting standards. Return ONLY valid JSON."
+        )
         user = f"""COMPANY: {profile.company_name} | Country: {profile.country} | Industry: {profile.industry}
 Listing: {profile.listing_status} | Framework: {profile.reporting_framework}
 Business: {profile.business_model_summary}
@@ -160,24 +190,26 @@ Extra instructions from the user: {spec.extra_instructions or 'none'}
 {structure_evidence}
 
 TASK
-Design the chapters of the {spec.financial_year} annual report of this company.
-- If a table of contents of the company's own report is given, it is your PRIMARY guide: keep its real chapter
-  names and order; drop only what clearly belongs to another year; add what the regulations above require
-  for {spec.financial_year}.
-- If none is given, derive the chapters from the evidence and from what the law / listing rules of
-  {profile.country} require for a company like this. Name chapters the way this jurisdiction names them.
-- Do NOT use a generic template. Include what THIS company needs, drop what it does not, add industry-specific
-  chapters when the industry demands them.
-- Cover the whole document in reading order (opening, messages, strategy/business, governance/statutory,
-  risk, people, sustainability, assurance, financial statements and notes, investor information, back matter)
-  only where applicable.
-- est_pages = how many pages that chapter occupies in a real report of this company (relative sizes matter).
+Design the complete start-to-end chapters of the {spec.financial_year} annual report for this company:
+1. PURE FIRST-PRINCIPLES DESIGN (ZERO FIXED TEMPLATES):
+   - DO NOT follow any fixed list of chapters or predefined template.
+   - If a table of contents from the company's real annual report is provided above, follow its authentic chapter titles and structural order.
+   - If no table of contents is provided, derive the chapters strictly from:
+     (a) The company's actual operating business model and distinct business segments.
+     (b) The corporate reporting laws, listing rules, and accounting standards of {profile.country or 'its primary jurisdiction'}.
+     (c) The primary audited financial statements and disclosures mandated for this entity type.
+   - Name each chapter naturally the way this company and jurisdiction name them.
+2. COMPANY-NATIVE SCOPE:
+   - Include only chapters that genuinely apply to this company.
+   - Drop anything that belongs to another industry or does not apply to this business model.
+3. DYNAMIC PAGE BUDGETING:
+   - est_pages = realistic page allocation for that chapter reflecting the company's scale and reporting depth.
 
 Return JSON:
 {{
   "estimated_total_pages": <integer, length of a real report of this company>,
   "chapters": [
-    {{"est_pages": <number>, "chapter_id": "<snake_case>", "rationale": "<which law / norm / company fact requires it>",
+    {{"est_pages": <number>, "chapter_id": "<snake_case>", "rationale": "<which law / company fact requires it>",
       "title": "...", "what_to_cover": "...", "kind": "...", "search_queries": [], "depends_on": [], "validation_criteria": []}}
   ]
 }}
@@ -186,88 +218,83 @@ Each chapter uses this node shape (plus est_pages, chapter_id, rationale): {NODE
         if isinstance(data, list):
             data = {"chapters": data}
         chaps = data.get("chapters") or []
-        chaps = self._ensure_statutory_completeness(chaps, profile, spec)
+        chaps = self._verify_lifecycle_completeness(chaps, profile, spec)
         if not chaps:
             raise RuntimeError("Planner returned no chapters")
         data["chapters"] = chaps
         return data
 
-    @staticmethod
-    def _ensure_statutory_completeness(chapters: List[dict], profile: CompanyProfile, spec: ReportInput) -> List[dict]:
-        """Ensure the planned chapters encompass the complete statutory annual report lifecycle."""
-        titles_lower = " ".join(str(c.get("title", "")).lower() for c in chapters)
-        
-        statutory_templates = [
-            ("Corporate Overview & Strategic Blueprint", "corporate_overview", "narrative", 6,
-             "Company profile, history, global presence, core values, and value creation model",
-             ["company overview global operations", "business model value creation"]),
-            ("Leadership & Strategic Addresses", "leadership_review", "message", 4,
-             "Chairman's statement and CEO strategic address to shareholders on performance, headwinds, and capital allocation",
-             ["chairman message letter to shareholders", "CEO review strategic priorities"]),
-            ("Management Discussion and Analysis", "management_discussion_analysis", "narrative", 12,
-             "Macroeconomic operating environment, segment-by-segment operational review, financial performance analysis, and strategic outlook",
-             ["management discussion analysis segment revenue", "operational review operating margin"]),
-            ("Enterprise Risk Management & Risk Register", "enterprise_risk_management", "narrative", 6,
-             "Risk governance framework, risk matrix, principal strategic, operational, financial, cybersecurity and climate risks, with mitigation strategies",
-             ["risk factors enterprise risk management", "principal risks cyber geopolitical climate"]),
-            ("Corporate Governance Report", "corporate_governance_report", "governance", 10,
-             "Board composition, independence, skill matrix, board committees (Audit, Nomination & Remuneration, Stakeholder Relationship), director remuneration, and meeting attendance",
-             ["corporate governance report board of directors", "board committees audit remuneration"]),
-            ("Board's Report & Statutory Disclosures", "boards_report_statutory", "governance", 8,
-             "Directors' statutory report, secretarial audit, internal financial controls, dividend recommendation, vigil mechanism, and compliance certifications",
-             ["directors report statutory disclosures", "secretarial audit internal financial controls"]),
-            ("Human Capital & Workplace Culture", "human_capital_resources", "narrative", 5,
-             "Workforce demographics, talent retention, diversity, equity and inclusion (DEI), learning & development, and employee health and safety",
-             ["employee headcount attrition diversity", "human capital learning health safety"]),
-            ("Sustainability & ESG Disclosures", "sustainability_esg_disclosures", "sustainability", 8,
-             "ESG strategy, net zero roadmap, environmental stewardship (Scope 1, 2, 3 emissions, energy, water), social responsibility/CSR, and responsible business governance (BRSR/GRI/TCFD)",
-             ["sustainability report BRSR ESG emissions", "CSR initiatives carbon neutrality"]),
-            ("Consolidated Financial Statements", "consolidated_financial_statements", "financial_statement", 15,
-             "Independent Auditor's Report, Consolidated Balance Sheet, Consolidated Statement of Profit and Loss, Consolidated Statement of Cash Flows, and Statement of Changes in Equity",
-             ["consolidated balance sheet statement profit loss", "cash flow statement changes in equity"]),
-            ("Notes to Consolidated Financial Statements", "notes_to_financial_statements", "notes_to_accounts", 14,
-             "Significant accounting policies, segment reporting disclosures, related party disclosures, tax disclosures, contingencies, commitments, and financial risk management",
-             ["notes to consolidated financial statements accounting policies", "segment reporting related party disclosures"]),
-            ("General Shareholder & Investor Information", "shareholder_information", "investor_information", 4,
-             "Shareholding pattern, market capitalization history, AGM notice and key dates, registrar & transfer agent, investor grievance mechanism, and listing contacts",
-             ["shareholding pattern promoters public", "annual general meeting notice investor relations"])
-        ]
-        
-        result = list(chapters)
-        have_text = titles_lower
-        for title, ch_id, kind, est_pages, what_to_cover, queries in statutory_templates:
-            key_words = title.lower().split()
-            matched = any(kw in have_text for kw in key_words if len(kw) > 4)
-            if not matched or len(result) < 8:
-                if not any(c.get("chapter_id") == ch_id or c.get("title") == title for c in result):
-                    result.append({
-                        "chapter_id": ch_id,
-                        "title": title,
-                        "est_pages": est_pages,
-                        "rationale": f"Statutory annual reporting standard for {profile.country or 'listed companies'}",
-                        "what_to_cover": what_to_cover,
-                        "kind": kind,
-                        "search_queries": [f"{profile.company_name} {q} {spec.financial_year}" for q in queries],
-                        "depends_on": [],
-                        "validation_criteria": [f"Must detail {what_to_cover[:80]} with tabular presentation where disclosed"]
-                    })
-                    have_text += " " + title.lower()
-        return result
+    def _verify_lifecycle_completeness(self, chapters: List[dict], profile: CompanyProfile, spec: ReportInput) -> List[dict]:
+        """Dynamically check that the report covers the complete start-to-end lifecycle (cover to financial statements)
+        specifically for this company and jurisdiction, without ANY hardcoded templates."""
+        has_fin = any(
+            c.get("kind") in ("financial_statement", "notes_to_accounts") or
+            any(k in str(c.get("title", "")).lower() for k in ("financial statement", "balance sheet", "statement of accounts", "audited accounts"))
+            for c in chapters
+        )
+        if len(chapters) >= 7 and has_fin:
+            return chapters
+
+        system = ("You are an expert statutory annual-report auditor. Verify that the proposed chapter outline represents "
+                  "a genuine, publication-grade annual report from front cover to back matter (including financial statements) "
+                  "specifically for this company and country. Return ONLY valid JSON.")
+        toc = "\n".join(f"- {c.get('title')} ({c.get('kind','')})" for c in chapters)
+        user = f"""COMPANY: {profile.company_name} | Country: {profile.country} | Industry: {profile.industry}
+Framework: {profile.reporting_framework} | Applicable Regulations: {profile.applicable_regulations}
+Key Segments: {profile.key_business_segments}
+
+CURRENT CHAPTER OUTLINE:
+{toc}
+
+TASK:
+Check if any mandatory statutory reporting sections or audited financial statements prescribed by {profile.country or 'its primary jurisdiction'} for an entity in {profile.industry} are missing.
+Do NOT return generic templates. If any essential section is missing, return ONLY the company-specific additions:
+{{
+  "additional_chapters": [
+    {{"est_pages": <number>, "chapter_id": "<snake_case>", "rationale": "<specific regulatory or industry requirement>",
+      "title": "...", "what_to_cover": "...", "kind": "<one of: cover, message, narrative, summary, data_table, financial_statement, notes_to_accounts, statutory, list, appendix>",
+      "search_queries": ["<search query with company name>"], "depends_on": [], "validation_criteria": ["<criterion>"]}}
+  ]
+}}
+If nothing essential is missing, return {{"additional_chapters": []}}."""
+        try:
+            res = self._ask_json(system, user, retries=2)
+            add = res.get("additional_chapters") or []
+            existing_titles = {str(c.get("title", "")).lower().strip() for c in chapters}
+            for c in add:
+                if isinstance(c, dict) and c.get("title") and str(c["title"]).lower().strip() not in existing_titles:
+                    chapters.append(c)
+        except Exception as e:
+            print(f"[Planner] Dynamic lifecycle verification skipped ({e}).")
+        return chapters
 
     def _critic_pass(self, spec, profile, chapters: List[dict]) -> List[dict]:
         toc = "\n".join(f"{i+1}. {c.get('title')} ({c.get('kind','')}, ~{c.get('est_pages','?')} pages)"
                         for i, c in enumerate(chapters))
-        system = "You are a statutory annual-report reviewer. Return ONLY valid JSON."
-        user = f"""Company: {profile.company_name} | {profile.country} | {profile.industry}
+        system = (
+            f"{DynamicReportArchitectSkill.get_instructions()}\n\n"
+            "You are the Lead Critic & Institutional Reviewer of annual reports. Review the proposed chapters "
+            "for structural integrity, relevance, and company specificity. Return ONLY valid JSON."
+        )
+        user = f"""COMPANY: {profile.company_name} | Country: {profile.country} | Industry: {profile.industry}
 Regulations: {profile.applicable_regulations}
+Key Segments: {profile.key_business_segments}
 Period: {spec.financial_year}
 
 PROPOSED CHAPTERS
 {toc}
 
-Would you sign off this as the complete annual report, front cover to back cover? Only demand items that
-genuinely apply to this company and jurisdiction; do not pad.
-Return JSON: {{"missing_chapters": [<chapter objects with est_pages>], "irrelevant_chapter_titles": ["<exact titles>"]}}
+CRITIQUE INSTRUCTIONS:
+1. Identify any chapter that is IRRELEVANT to this specific business model or industry (e.g., manufacturing chapters for pure IT services, or bank-specific capital ratios for non-financial companies) and flag its exact title to remove.
+2. Identify any DUPLICATION or overlap that should be merged.
+3. Identify any CRITICAL MISSING statutory or company-specific chapters needed for a complete start-to-end report.
+4. Ensure every chapter is tailored to THIS company.
+
+Return JSON:
+{{
+  "missing_chapters": [<chapter objects with est_pages, chapter_id, rationale, title, what_to_cover, kind, search_queries, depends_on, validation_criteria>],
+  "irrelevant_chapter_titles": ["<exact titles to drop>"]
+}}
 Chapter object shape: {NODE_SHAPE} plus est_pages, chapter_id, rationale."""
         try:
             review = self._ask_json(system, user, retries=2)
@@ -317,47 +344,31 @@ Return JSON: {{"subsections": [ {NODE_SHAPE} ]}}"""
             print(f"[Planner] LLM split for '{node['title']}' ({e}); generating structured sub-sections.")
 
         if len(subs) < 2 and words > settings.LEAF_MAX_WORDS:
-            t_low = node["title"].lower()
-            if "financial statement" in t_low or "balance sheet" in t_low:
-                sub_names = ["Independent Auditor's Report", "Consolidated Balance Sheet",
-                             "Consolidated Statement of Profit and Loss", "Consolidated Statement of Cash Flows",
-                             "Consolidated Statement of Changes in Equity"]
-                k = "financial_statement"
-            elif "governance" in t_low:
-                sub_names = ["Board Composition and Independence", "Board Committees and Mandates",
-                             "Director Remuneration and Governance Policies"]
-                k = "governance"
-            elif "risk" in t_low:
-                sub_names = ["Risk Management Framework & Governance", "Principal Enterprise & Operational Risks",
-                             "Cybersecurity, Climate and Emerging Risks"]
-                k = "narrative"
-            elif "sustainab" in t_low or "esg" in t_low or "brsr" in t_low:
-                sub_names = ["ESG Strategy and Sustainability Commitments", "Environmental Stewardship and GHG Emissions",
-                             "Social Responsibility and Community Impact"]
-                k = "sustainability"
-            elif "management discussion" in t_low or "md&a" in t_low or "operations" in t_low:
-                sub_names = ["Macroeconomic Environment & Industry Trends", "Segment Operations and Business Performance",
-                             "Financial Performance and Margin Analysis", "Strategic Outlook and Growth Priorities"]
-                k = "narrative"
-            elif "note" in t_low:
-                sub_names = ["Significant Accounting Policies", "Segment Reporting Disclosures",
-                             "Related Party Transactions and Contingent Liabilities"]
-                k = "notes_to_accounts"
-            elif "leadership" in t_low or "message" in t_low or "letter" in t_low:
-                sub_names = ["Chairman's Statement to Shareholders", "Chief Executive Officer's Strategic Review"]
-                k = "message"
-            elif "shareholder" in t_low or "investor" in t_low:
-                sub_names = ["Shareholding Pattern and Market Capitalization", "Annual General Meeting Notice and Contacts"]
-                k = "investor_information"
-            else:
-                sub_names = [f"{node['title']} - Overview and Operational Framework",
-                             f"{node['title']} - Key Metrics, Performance and Performance Drivers",
-                             f"{node['title']} - Statutory Governance and Future Outlook"]
-                k = node.get("kind", "narrative")
+            # Dynamically derive sub-parts without any hardcoded names
+            try:
+                retry_user = (
+                    f"COMPANY: {profile.company_name} | {profile.industry} | {spec.financial_year}\n"
+                    f"Break the section '{node['title']}' into {n_min} logical, distinct sub-sections tailored to this company.\n"
+                    f"What it covers: {node.get('what_to_cover', '')}\n"
+                    f"Return JSON: {{\"subsections\": [ {NODE_SHAPE} ]}}"
+                )
+                data = self._ask_json(system, retry_user, retries=1)
+                raw_subs = data.get("subsections") if isinstance(data, dict) else data
+                subs = [s for s in (raw_subs or []) if isinstance(s, dict) and s.get("title")]
+            except Exception:
+                subs = []
 
+        if len(subs) < 2 and words > settings.LEAF_MAX_WORDS:
+            # Purely generic fallback derived dynamically from node title and business context
+            sub_names = [
+                f"{node['title']} - Operational Framework & Review",
+                f"{node['title']} - Key Disclosures & Performance Metrics",
+                f"{node['title']} - Statutory Governance & Future Outlook"
+            ]
+            k = node.get("kind", "narrative")
             subs = [{
                 "title": name,
-                "what_to_cover": f"Detailed coverage of {name} for {profile.company_name} ({spec.financial_year})",
+                "what_to_cover": f"Comprehensive analysis and verified disclosures for {name} ({profile.company_name}, {spec.financial_year})",
                 "kind": k,
                 "weight": 1.0,
                 "search_queries": [f"{profile.company_name} {name} {spec.financial_year}"],

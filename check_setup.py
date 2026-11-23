@@ -9,9 +9,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # file -> text that only the NEW version contains (detects old files left over from the first version)
 FILES = {
     "main.py": "class MainOrchestrator", "planner.py": "_split_node", "agent.py": "class RunContext",
-    "knowledge.py": "class ReferenceIngestor", "validator.py": "_duplicates", "assembler.py": "parse_markdown_blocks",
+    "knowledge.py": "class ReferenceIngestor", "validator.py": "_foreign_entities", "assembler.py": "parse_markdown_blocks",
     "config.py": "class AnthropicClient", "schemas.py": "class SourceDocument", "tools.py": "def download_pdf",
-    "skills.py": "STYLE_GUIDES", "utils.py": "def extract_json",
+    "skills.py": "STYLE_GUIDES", "approvals.py": "class ApprovalAborted", "utils.py": "def foreign_entities",
 }
 PACKAGES = [("requests", "requests"), ("bs4", "beautifulsoup4"), ("ddgs", "ddgs"), ("pydantic", "pydantic"),
             ("dotenv", "python-dotenv"), ("docx", "python-docx"), ("reportlab", "reportlab")]

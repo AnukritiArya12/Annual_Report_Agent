@@ -87,7 +87,7 @@ class Settings:
     PDF_TABLES: bool = _bool("PDF_TABLES", True)       # extract real tables from PDFs (slower, far better numbers)
     CHUNK_WORDS: int = _int("CHUNK_WORDS", 300)
     CHUNK_OVERLAP_WORDS: int = _int("CHUNK_OVERLAP_WORDS", 50)
-    RETRIEVAL_TOP_K: int = _int("RETRIEVAL_TOP_K", 15)
+    RETRIEVAL_TOP_K: int = _int("RETRIEVAL_TOP_K", 10)
     MIN_KB_HITS_BEFORE_WEB: int = _int("MIN_KB_HITS_BEFORE_WEB", 4)
     MAX_SEARCH_RESULTS: int = _int("MAX_SEARCH_RESULTS", 4)
     MAX_EVIDENCE_CHARS: int = _int("MAX_EVIDENCE_CHARS", 16000)
