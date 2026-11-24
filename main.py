@@ -70,7 +70,7 @@ class MainOrchestrator:
             ingestor = ReferenceIngestor(self.tools, kb, self.run_dir)
             docs = ingestor.ingest(spec)
             kb.save(self.kb_path)
-            reference_toc = ingestor.contents.get(docs[0].doc_id, "") if docs else ""
+            reference_toc = ingestor.contents.get("peer_toc") or (ingestor.contents.get(docs[0].doc_id, "") if docs else "")
             if not docs:
                 print("  WARNING: the agent found no source documents at all (see the [Ingest] lines above for why). "
                       "Sections will rest on per-section web search only and will be thin.")
@@ -377,6 +377,12 @@ def parse_arguments():
                    help="Skip all human approval questions (accept the agent's own choices). Default: ask the human.")
     p.add_argument("--plan-only", action="store_true", help="Only design the structure, print the outline, then stop")
     p.add_argument("--resume", action="store_true", help="Reuse the saved plan, knowledge base and finished sections")
+    p.add_argument("--first-year", action="store_true",
+                   help="Generate a Maiden / First-Year Annual Report (for newly incorporated entities or entities without prior reports)")
+    p.add_argument("--dossier", default=None, metavar="PATH",
+                   help="Path to local company intake dossier JSON (incorporation date, capital, founders, initial financials)")
+    p.add_argument("--peer-report", default=None, metavar="PATH_OR_URL",
+                   help="Optional peer company annual report (PDF or URL) to benchmark industry structure and topics")
     a = p.parse_args()
     if a.low_quota:
         settings.MAX_PARALLEL_WORKERS = 1
@@ -392,7 +398,8 @@ def parse_arguments():
     settings.AUTO_APPROVE = a.auto_approve
     return ReportInput(company_name=a.company, financial_year=a.fy, country=a.country, industry=a.industry,
                        reporting_scope=a.scope, extra_instructions=a.extra, target_pages=a.pages,
-                       source_documents=a.pdf), a.resume, a.plan_only
+                       source_documents=a.pdf, is_first_year=a.first_year, dossier_path=a.dossier,
+                       peer_report_path=a.peer_report), a.resume, a.plan_only
 
 
 if __name__ == "__main__":

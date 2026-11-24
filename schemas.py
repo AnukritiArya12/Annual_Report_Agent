@@ -28,6 +28,9 @@ class ReportInput(BaseModel):
     extra_instructions: Optional[str] = None
     target_pages: Optional[int] = None          # override the automatic length estimate
     source_documents: List[str] = Field(default_factory=list)  # local PDFs / URLs supplied by the user
+    is_first_year: bool = False
+    dossier_path: Optional[str] = None
+    peer_report_path: Optional[str] = None      # structural benchmark peer report (TOC reference only)
 
 
 class CompanyProfile(BaseModel):
@@ -44,6 +47,10 @@ class CompanyProfile(BaseModel):
     reporting_framework: str = ""
     official_sources: List[str] = Field(default_factory=list)
     peer_competitors: List[str] = Field(default_factory=list)
+    is_first_year: bool = False
+    incorporation_date: Optional[str] = None
+    statutory_framework: Optional[str] = None
+    peer_toc: Optional[str] = None
     researched_at: datetime = Field(default_factory=_now)
 
 

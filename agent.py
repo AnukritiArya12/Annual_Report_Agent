@@ -294,6 +294,13 @@ class GenericTaskExecutionAgent:
             f"say it, write 'Not disclosed in the sources reviewed'.\n")
         if banned:
             scope_rules += f"9. NEVER mention or use anything about: {', '.join(banned)} (not part of this report).\n"
+        first_year_rule = ""
+        if p.is_first_year:
+            first_year_rule = (
+                "10. FIRST-YEAR REPORTING ENTITY: This is the company's inaugural financial period since incorporation. "
+                "In multi-year comparative tables or preceding-period columns, write 'N/A (First Year of Operations)' "
+                "for earlier period cells. Do NOT leave cells blank or guess prior year figures.\n"
+            )
         return (
             f"{EvidenceGroundedWritingSkill.get_instructions()}\n\n"
             f"You are the Chief Financial Writer and Corporate Governance Analyst for the annual report of {p.company_name}. "
@@ -303,11 +310,12 @@ class GenericTaskExecutionAgent:
             f"1. Ground all numbers, percentages, financial line items, dates, and names strictly in the provided EVIDENCE or earlier sections. Never fabricate financial figures.\n"
             f"2. Be thorough about what the EVIDENCE contains and explain it clearly. Where a point is missing from the evidence, say '{NOT_DISCLOSED}' once for that point and move on; do not fill the gap with general knowledge or generic statements.\n"
             f"3. Cite evidence inline as [E1], [E2]. Every reported figure must carry its currency, unit, and period. If evidence refers to another fiscal period, state the period explicitly.\n"
-            f"4. ZERO BLANK TABLE CELLS: When numerical or structured evidence is available, present structured Markdown tables with balanced columns, headers, and '| :--- |' separators. NEVER leave any table cell blank ('| |' or '|   |'). If a value is reported, output the exact value; if absent, enter 'Not Disclosed' or 'n/d'.\n"
+            f"4. ZERO BLANK TABLE CELLS & EVIDENCE-DRIVEN COLUMNS: Only create table columns and rows for metrics and periods that ACTUALLY EXIST in the EVIDENCE. Do NOT invent empty speculative columns (like prior years or growth) that force you to write 'Not Disclosed'. A table where 100% of cells have real numbers is vastly superior. NEVER leave any table cell blank ('| |' or '|   |'). Output exact reported figures with units/currency.\n"
             f"5. Scope & Structure: Stay inside this part's scope. Do not repeat what earlier parts already covered. Begin directly with this section's core content without introductory fluff or preamble.\n"
             f"6. Length: aim for about {task.target_words} words only if the evidence supports it; a shorter accurate section is better than padding.\n"
             f"7. Output ONLY the Markdown body. Do NOT start with the section's own title (it is rendered by the assembler). Use '####' sub-headings where useful.\n"
             f"{scope_rules}"
+            f"{first_year_rule}"
             f"STYLE FOR THIS KIND OF PART ({task.kind}): {get_style_guidance(task.kind)}"
         )
 

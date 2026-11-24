@@ -126,17 +126,28 @@ DECISION RULES & OPERATIONAL WORKFLOW:
    - Identify the primary country of incorporation, listing domicile, and applicable corporate law.
    - Map the mandatory disclosure regime (e.g. US SEC Form 10-K, UK Companies Act Strategic Report, India SEBI LODR / Companies Act / RBI, European CSRD/IFRS).
    - Identify the primary accounting framework (US GAAP, IFRS, Ind AS, local GAAP) and fiscal year convention.
-3. SOURCE PROVENANCE VERIFICATION:
-   - Examine candidate filings and reports retrieved from regulatory databases, company investor relations, or web search.
-   - Verify that the title, registration identifier, and reporting entity match the target company.
+3. SOURCE PROVENANCE VERIFICATION & THREE-DEPARTMENT INTERNAL DOSSIER:
+   - For established entities with public filings: Verify that candidate filings match the target company.
+   - For maiden/unlisted entities with zero online presence (Cold-Start): Ingest primary corporate records partitioned into three authentic company departments:
+     (a) Executive / Founder & CEO Office: Mission, corporate vision, business model, inaugural milestones, strategic market trajectory.
+     (b) Finance & Accounts Department: Equity capitalization, funding rounds, trial balance, Schedule III / GAAP opening financial statements, operating expenses, cash & bank balances, accounting policies.
+     (c) Legal, Company Secretarial & Governance Department: Certificate of Incorporation, CIN, registered office, Board of Directors & KMP details, Board meetings (Section 173), statutory auditor appointment (Section 139), and statutory legal compliance status.
    - EXCLUDE any document belonging to peer competitors, external industry analyses, or independent subsidiaries unless consolidated.
-4. HUMAN SUPERVISION GATE:
+4. ARTICLE SELECTION & WEB CORPUS TRIAGING PROTOCOL (WHEN NO PDF REPORT EXISTS):
+   - When relying on public articles and web intelligence, select and triage sources using a strict 5-filter hierarchy:
+     (a) Entity Subject Focus: The article must be primarily ABOUT the target company, not competitors or casual mentions.
+     (b) Authoritative Publisher Tier: Prioritize regulatory announcements (SEC, BSE, NSE), company investor relations portals, and Tier-1 financial media (Reuters, Bloomberg, Economic Times, Mint, FT, WSJ) over blogs, syndicators, or forums.
+     (c) Temporal Alignment: Prioritize articles reporting directly on the target financial period (e.g. FY 2024-25) over outdated multi-year archives.
+     (d) Hard Quantitative Substance: Select articles disclosing audited figures (revenue, net profit, EBITDA, dividends, cash flow, debt) and governance facts over vague marketing PR.
+     (e) Noise & Spam Elimination: Discard clickbait, career/recruitment ads, stock forums, and unverified rumour mills.
+5. HUMAN SUPERVISION GATE:
    - Present the resolved legal entity, identifiers, primary jurisdiction, and verified source documents for human confirmation.
-   - Ensure the user confirms that the sources belong strictly to the target company and the requested financial year before indexing.
+   - Present candidate web articles with their relevance scores and domains for explicit human selection (Checkpoint 4b) before indexing.
 
 RECOVERY STRATEGIES:
 - If automated regulatory filing retrieval fails, transition to the company's official Investor Relations web portal.
-- If corporate naming is ambiguous, pause and prompt the human supervisor with disambiguation choices."""
+- If corporate naming is ambiguous, pause and prompt the human supervisor with disambiguation choices.
+- If zero public records exist, activate the Cold-Start Intake Protocol to collect records directly from the Founder/CEO, Finance, and Secretarial teams."""
 
     @classmethod
     def get_instructions(cls) -> str:
@@ -185,13 +196,27 @@ DECISION RULES & OPERATIONAL WORKFLOW:
      * Mid-sized or focused companies: ~50-100 pages.
      * Large diversified multinationals or financial institutions: ~150-350+ pages.
    - Distribute page and word budgets across chapters proportionally according to their material significance.
-4. CRITIQUE, PRUNING & REFINEMENT PROTOCOL:
+4. FIRST-YEAR / INAUGURAL ANNUAL REPORT ARCHITECTURE (COLD-START ENTITIES):
+   - When the entity is in its first reporting period (newly incorporated, startup, or private entity with zero prior reports):
+     * PEER STRUCTURAL BENCHMARKING (OPTIONAL BUT RECOMMENDED):
+       - When available or provided (--peer-report), benchmark against an established peer company's annual report in the same sector to identify authentic industry chapter taxonomy, thematic disclosure areas, and sector-specific operational KPIs.
+       - STRICT ISOLATION: Use peer reports strictly for structural inspiration; NEVER copy or extrapolate peer financials or operational figures.
+     * MANDATORY STATUTORY SECTIONS UNDER CORPORATE LAW (e.g. INDIA COMPANIES ACT 2013):
+       - Section 134(3) Board's Report: State of affairs, number of board meetings (Section 173), Directors' Responsibility Statement under Section 134(5), contracts with related parties (Section 188), risk management policy.
+       - Section 129 & Schedule III Financial Statements: Balance Sheet, Statement of Profit & Loss, Cash Flow Statement; all comparative prior-period columns marked 'N/A (First Year of Operations)'.
+       - Section 135 CSR Applicability: Explicit threshold evaluation (Net Worth >= ₹500 Cr, Turnover >= ₹1000 Cr, Net Profit >= ₹5 Cr); if below thresholds, disclose: 'Not Applicable under Section 135(1)'.
+       - Section 143 Statutory Auditor's Report & Notes to Accounts: Note 1 Basis of Preparation for Initial Financial Period from incorporation date.
+     * THREE-DEPARTMENT CONTENT HARMONIZATION:
+       - CEO Office: Strategic Vision, Genesis & Inaugural Milestones.
+       - Secretarial Team: Board Governance, Directors' Report, Statutory Compliances.
+       - Finance Team: Schedule III Financial Statements & Accounting Notes.
+5. CRITIQUE, PRUNING & REFINEMENT PROTOCOL:
    - Evaluate the synthesized structure with an autonomous critic pass:
      * PRUNE irrelevant chapters (e.g., no inventory/plant chapters for digital services; no banking capital adequacy for non-banks).
      * MERGE overlapping or redundant sections to eliminate duplication.
      * ENSURE statutory and financial statement completeness specific to the company's jurisdiction.
      * Split chapters recursively into atomic leaf tasks (300 to 1,200 words) with clear evidence queries and validation criteria.
-5. HUMAN SUPERVISION GATE:
+6. HUMAN SUPERVISION GATE:
    - Present the dynamically generated blueprint (chapters, sections, budgets, and rationale) to the human supervisor for approval or modification BEFORE generating content."""
 
     @classmethod
@@ -223,19 +248,24 @@ DECISION RULES & OPERATIONAL WORKFLOW:
    - NEVER fabricate, extrapolate, or estimate numerical figures.
    - Where a specific detail or metric is not disclosed in the evidence, state 'Not Disclosed in Sources Reviewed' (or 'n/d') once and proceed.
    - Do NOT fill disclosure gaps with generic boilerplate or external assumptions.
-2. ZERO BLANK TABLE CELLS PROTOCOL (MANDATORY REQUIREMENT):
-   - Every Markdown table must be well-formed with aligned columns, clear headers, and '| :--- |' separators.
+2. ZERO BLANK TABLE CELLS & EVIDENCE-DRIVEN TABLE DIMENSIONS:
+   - ONLY create table columns and rows for periods and metrics that ACTUALLY EXIST in the provided evidence. DO NOT invent speculative columns (such as prior years, variance, or growth) if the evidence does not provide figures for them.
+   - Every Markdown table must be well-formed with balanced columns, headers, and '| :--- |' separators.
    - NEVER leave any cell empty or blank ('| |' or '|   |').
    - If a numerical value is present in the evidence, report the exact figure accompanied by unit and currency.
-   - If a cell value is not present in the evidence for that specific period or segment, explicitly enter 'Not Disclosed' or 'n/d'.
+   - Avoid creating ghost columns that force you to write 'Not Disclosed'. A compact table where 100% of cells have real numbers is far superior to a wide table filled with 'n/d'.
    - Every column header MUST specify the reporting period (e.g., 'FY 2024-25', 'As at March 31, 2024') and unit/currency.
-3. ENTITY ISOLATION GUARD:
+3. ENTITY ISOLATION GUARD & PEER DATA FIREWALL:
    - The report is SOLELY about the target company and its consolidated group.
    - Never describe external competitors or third parties as if they were part of the reporting company.
+   - PEER BENCHMARK FIREWALL: Even if a peer company's annual report was consulted as a structural benchmark (--peer-report), NEVER quote peer financial numbers, peer executives, or peer operations. All numbers and statements must come solely from the target company's evidence.
    - External entities (statutory auditors, regulators, key technology partners, credit rating agencies) may be mentioned ONLY when explicitly named in the evidence in an external capacity.
 4. METRIC & UNIT INTEGRITY:
    - Always state currency and scale (e.g. ₹ Crore, US$ Millions, € Millions) for every figure reported in narrative and tables.
-5. RECOVERY & VALIDATION PROTOCOL:
+5. FIRST-YEAR COMPARATIVE DATA PROTOCOL:
+   - In multi-year comparative tables or financial statements for a first-year reporting entity, prior-period columns MUST be filled with 'N/A (First Year)' or 'N/A (Initial Period)'.
+   - NEVER leave prior-period cells blank or marked 'Not Disclosed'. State explicitly that preceding period figures are not applicable due to maiden operational period.
+6. RECOVERY & VALIDATION PROTOCOL:
    - If evidence retrieved for a section is thin, execute targeted live queries or clearly document the disclosure gap.
    - If a draft is rejected by validation (e.g. for empty table cells or ungrounded claims), revise the section immediately by eliminating the offending content and adding explicit disclosure notices."""
 

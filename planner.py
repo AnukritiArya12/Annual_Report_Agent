@@ -75,6 +75,11 @@ class DynamicPlanningEngine:
         for ch, _ in self.kb.search(f"{co} about the company business segments listed stock exchange subsidiaries",
                                     k=4, doc_ids=[d.doc_id for d in docs] or None):
             notes.append(f"[company report p.{ch.page}] {ch.text}")
+        is_first_year = bool(spec.is_first_year or any(d.kind == "first_year_dossier" for d in docs))
+        if is_first_year:
+            for ch, _ in self.kb.search(f"{co} genesis charter incorporation capital founders financial statements",
+                                        k=6, doc_ids=[d.doc_id for d in docs] or None):
+                notes.append(f"[corporate charter dossier p.{ch.page}] {ch.text}")
 
         system = (
             f"{CompanyIntelligenceSkill.get_instructions()}\n\n"
@@ -102,13 +107,17 @@ disclosure rules that really apply to this company in its country), reporting_fr
             data["country"] = data.get("country") or spec.country
             data["industry"] = data.get("industry") or spec.industry or "Unknown"
             data["official_sources"] = list(dict.fromkeys(official))[:5]
+            if is_first_year:
+                data["is_first_year"] = True
+                data["listing_status"] = data.get("listing_status") or "Unlisted Private Entity (Inaugural Financial Period)"
+                data["reporting_framework"] = data.get("reporting_framework") or f"Statutory First-Year Report ({spec.country or 'Company Law'})"
             profile = CompanyProfile(**data)
         except QuotaExhausted:
             raise
         except Exception as e:
             print(f"[Planner] Profile step failed ({e}); continuing with a minimal profile (no invented facts).")
             profile = CompanyProfile(company_name=co, country=spec.country, industry=spec.industry or "Unknown",
-                                     official_sources=official[:5])
+                                     official_sources=official[:5], is_first_year=is_first_year)
         profile = self._confirm_profile(profile)                      # HUMAN CHECKPOINT 5
         print(f"[Planner] Profile: {profile.industry} | {profile.country} | {profile.reporting_framework or 'framework n/a'}")
         return profile
@@ -160,10 +169,25 @@ disclosure rules that really apply to this company in its country), reporting_fr
 
     # -------------------------------------------------- 2. structure evidence
     def _structure_evidence(self, spec: ReportInput, profile: CompanyProfile, reference_toc: str) -> str:
+        res = []
         if reference_toc.strip():
-            return "TABLE OF CONTENTS OF THIS COMPANY'S OWN REPORT:\n" + reference_toc
+            res.append("TABLE OF CONTENTS OF REFERENCE / PEER BENCHMARK REPORT (for chapter flow and industry topics):\n" + reference_toc)
+        if profile.is_first_year:
+            res.append(
+                "FIRST-YEAR INAUGURAL ANNUAL REPORT STATUTORY & DEPARTMENTAL SPECIFICATION:\n"
+                "- Executive / CEO Office: Strategic Vision, Business Model, Genesis, Maiden Operational Milestones\n"
+                "- Secretarial & Governance Department: Statutory Board of Directors' Report under Companies Act 2013 Section 134 "
+                "(State of affairs, Section 173 Board meetings, Section 134(5) Directors' Responsibility Statement, "
+                "Section 135 CSR threshold evaluation, Section 188 Related Party Disclosures, Section 139 Auditor Appointment)\n"
+                "- Finance & Accounts Department: Schedule III Financial Statements (Balance Sheet, Statement of Profit & Loss, "
+                "Cash Flow Statement) with all preceding-period columns marked 'N/A (First Year of Operations)', "
+                "Significant Accounting Policies (Ind AS / AS), Notes to Accounts, and Statutory Auditor's Report (Section 143)"
+            )
+        if res:
+            return "\n\n".join(res)
         chunks = []
         for q in (f"{profile.company_name} annual report table of contents",
+                  f"{profile.country} {profile.industry} annual report structure table of contents",
                   f"{profile.country} listed company annual report mandatory disclosures {profile.industry}"):
             for r in self.tools.web_search(q, max_results=3):
                 chunks.append(f"[{q}] {r['title']} ({r['href']})\n{r['body']}")
@@ -184,6 +208,7 @@ Business: {profile.business_model_summary}
 Segments: {profile.key_business_segments}
 Regulations that apply: {profile.applicable_regulations}
 Reporting period: {spec.financial_year} | Scope: {spec.reporting_scope}
+Reporting nature: {'FIRST-YEAR / INAUGURAL ANNUAL REPORT (Initial operational period since incorporation)' if profile.is_first_year else 'Standard ongoing reporting period'}
 Reference report length (pages): {ref_pages or 'unknown'}
 Extra instructions from the user: {spec.extra_instructions or 'none'}
 

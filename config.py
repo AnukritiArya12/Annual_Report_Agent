@@ -72,7 +72,7 @@ class Settings:
     LLM_MIN_INTERVAL_SECONDS: float = _float("LLM_MIN_INTERVAL_SECONDS", 6.0 if LLM_PROVIDER == "gemini" else 0.0)
 
     # --- Report size (everything is derived from these, nothing is fixed) ----
-    WORDS_PER_PAGE: int = _int("WORDS_PER_PAGE", 420)
+    WORDS_PER_PAGE: int = _int("WORDS_PER_PAGE", 350)
     MIN_PAGES: int = _int("MIN_PAGES", 30)
     MAX_PAGES: int = _int("MAX_PAGES", 500)
     LEAF_MAX_WORDS: int = _int("LEAF_MAX_WORDS", 1200)   # a section bigger than this is split further
