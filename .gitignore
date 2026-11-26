@@ -4,3 +4,10 @@ __pycache__/
 runs/
 .venv/
 venv/
+tests/_tmp_*/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+matplotlib_cache/

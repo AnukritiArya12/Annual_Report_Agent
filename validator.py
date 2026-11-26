@@ -9,7 +9,6 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
-import approvals
 from config import QuotaExhausted, get_llm, settings
 from financial import FinancialVerifier
 from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus
@@ -67,7 +66,7 @@ class DynamicValidator:
         if not self.names:
             return []
         evidence = " ".join(e.text for e in output.evidence_used)
-        flags = foreign_entities(text, self.names, self.excluded, evidence, approvals.entity_statuses(),
+        flags = foreign_entities(text, self.names, self.excluded, evidence, getattr(self, "entity_statuses", {}),
                                 allow_list=self.allow_list)
         self.entity_flags[task.task_id] = flags
         if not flags:

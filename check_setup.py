@@ -18,7 +18,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CORE_FILES = {
     "agent.py": "create_deep_agent",
     "app.py": "build_annual_report_agent",
-    "approvals.py": "class ApprovalAborted",
     "assembler.py": "class ReportAssembler",
     "charts.py": "class ChartGenerator",
     "config.py": "class Settings",
