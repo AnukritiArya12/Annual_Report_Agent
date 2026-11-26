@@ -13,7 +13,7 @@ import approvals
 from config import QuotaExhausted, get_llm, settings
 from financial import FinancialVerifier
 from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus
-from skills import REVIEW_GUIDANCE
+from skills import REVIEW_GUIDANCE, ValidationAndQualitySkill
 from statements import get_statement_for_task
 from utils import extract_json, foreign_entities, shingle_set, word_count
 
@@ -223,11 +223,15 @@ class DynamicValidator:
 
     def _llm_review(self, task: TaskDefinition, output: TaskOutput, text: str) -> List[str]:
         evid = "\n".join(f"[{i+1}] {e.text[:350]}" for i, e in enumerate(output.evidence_used[:8]))
-        system = ("You are a strict annual-report audit reviewer. Judge ONLY the two things asked. "
-                  "Return ONLY JSON: {\"verdict\": \"PASS\" | \"FAIL\", \"issues\": [\"...\"]}.\n" + REVIEW_GUIDANCE)
+        system = (
+            ValidationAndQualitySkill.get_instructions() + "\n\n"
+            "You are a strict annual-report audit reviewer. Judge ONLY the two things asked. "
+            "Return ONLY JSON: {\"verdict\": \"PASS\" | \"FAIL\", \"issues\": [\"...\"]}.\n"
+            + REVIEW_GUIDANCE
+        )
         user = f"""Section: {task.title}
 Acceptance criteria:
-{chr(10).join('- ' + c for c in task.validation_criteria)}
+{chr(10).join("- " + c for c in task.validation_criteria)}
 
 1. Does the draft satisfy every criterion (a criterion is also satisfied by an honest 'Not disclosed in the sources reviewed')?
 2. Does the draft state specific facts or figures that clearly contradict or are absent from the evidence excerpts?
