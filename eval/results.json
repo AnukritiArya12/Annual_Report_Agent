@@ -1,0 +1,114 @@
+{
+  "eval_timestamp": "2026-11-26T05:14:03.981898Z",
+  "total_elapsed_seconds": 0.0,
+  "cases_run": 7,
+  "config_path": "D:\\Annual_Report_Agent\\eval\\eval_config.json",
+  "cases": [
+    {
+      "case_id": "us_tech",
+      "company": "Microsoft Corporation",
+      "fy": "FY 2024",
+      "country": "USA",
+      "industry": "Technology",
+      "tags": [
+        "usa",
+        "tech",
+        "listed",
+        "large-cap"
+      ],
+      "exit_code": 0,
+      "dry_run": true
+    },
+    {
+      "case_id": "india_it",
+      "company": "Infosys Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "IT Services",
+      "tags": [
+        "india",
+        "it",
+        "listed",
+        "large-cap"
+      ],
+      "exit_code": 0,
+      "dry_run": true
+    },
+    {
+      "case_id": "india_bank",
+      "company": "HDFC Bank Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "Banking & Financial Services",
+      "tags": [
+        "india",
+        "bank",
+        "listed",
+        "regulated"
+      ],
+      "exit_code": 0,
+      "dry_run": true
+    },
+    {
+      "case_id": "us_pharma",
+      "company": "Johnson & Johnson",
+      "fy": "FY 2024",
+      "country": "USA",
+      "industry": "Pharmaceuticals",
+      "tags": [
+        "usa",
+        "pharma",
+        "listed",
+        "large-cap"
+      ],
+      "exit_code": 0,
+      "dry_run": true
+    },
+    {
+      "case_id": "india_manufacturer",
+      "company": "Larsen & Toubro Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "Engineering & Construction",
+      "tags": [
+        "india",
+        "manufacturing",
+        "listed",
+        "large-cap"
+      ],
+      "exit_code": 0,
+      "dry_run": true
+    },
+    {
+      "case_id": "uk_bank",
+      "company": "Lloyds Banking Group",
+      "fy": "FY 2024",
+      "country": "UK",
+      "industry": "Banking & Financial Services",
+      "tags": [
+        "uk",
+        "bank",
+        "listed",
+        "regulated"
+      ],
+      "exit_code": 0,
+      "dry_run": true
+    },
+    {
+      "case_id": "first_year_startup",
+      "company": "NovaSpark Technologies Private Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "Deep Tech / AI",
+      "tags": [
+        "india",
+        "startup",
+        "first-year",
+        "unlisted",
+        "small"
+      ],
+      "exit_code": 0,
+      "dry_run": true
+    }
+  ]
+}

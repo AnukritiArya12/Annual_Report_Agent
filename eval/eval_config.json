@@ -1,0 +1,91 @@
+{
+  "_comment": "Eval harness configuration. All company names live ONLY here, never in code.",
+  "eval_cases": [
+    {
+      "id": "us_tech",
+      "description": "Large-cap US technology company (NASDAQ-listed)",
+      "company": "Microsoft Corporation",
+      "fy": "FY 2024",
+      "country": "USA",
+      "industry": "Technology",
+      "pages": 50,
+      "scope": "consolidated",
+      "tags": ["usa", "tech", "listed", "large-cap"]
+    },
+    {
+      "id": "india_it",
+      "description": "India IT services bellwether (BSE/NSE-listed)",
+      "company": "Infosys Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "IT Services",
+      "pages": 60,
+      "scope": "consolidated",
+      "tags": ["india", "it", "listed", "large-cap"]
+    },
+    {
+      "id": "india_bank",
+      "description": "India private-sector bank (RBI-regulated)",
+      "company": "HDFC Bank Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "Banking & Financial Services",
+      "pages": 60,
+      "scope": "standalone",
+      "tags": ["india", "bank", "listed", "regulated"]
+    },
+    {
+      "id": "us_pharma",
+      "description": "US multinational pharmaceutical company (NYSE-listed)",
+      "company": "Johnson & Johnson",
+      "fy": "FY 2024",
+      "country": "USA",
+      "industry": "Pharmaceuticals",
+      "pages": 55,
+      "scope": "consolidated",
+      "tags": ["usa", "pharma", "listed", "large-cap"]
+    },
+    {
+      "id": "india_manufacturer",
+      "description": "Indian diversified manufacturing conglomerate",
+      "company": "Larsen & Toubro Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "Engineering & Construction",
+      "pages": 60,
+      "scope": "consolidated",
+      "tags": ["india", "manufacturing", "listed", "large-cap"]
+    },
+    {
+      "id": "uk_bank",
+      "description": "UK retail and commercial bank (FCA/PRA-regulated)",
+      "company": "Lloyds Banking Group",
+      "fy": "FY 2024",
+      "country": "UK",
+      "industry": "Banking & Financial Services",
+      "pages": 50,
+      "scope": "consolidated",
+      "tags": ["uk", "bank", "listed", "regulated"]
+    },
+    {
+      "id": "first_year_startup",
+      "description": "First-year/inaugural Indian startup (no online presence, dossier-only)",
+      "company": "NovaSpark Technologies Private Limited",
+      "fy": "FY 2024-25",
+      "country": "India",
+      "industry": "Deep Tech / AI",
+      "pages": 30,
+      "scope": "standalone",
+      "first_year": true,
+      "tags": ["india", "startup", "first-year", "unlisted", "small"]
+    }
+  ],
+  "metrics": {
+    "min_sections": 10,
+    "min_words": 5000,
+    "max_repetition_rate": 0.15,
+    "min_evidence_grounding_pct": 0.50,
+    "max_ledger_violations": 5,
+    "max_foreign_entity_flags": 10
+  }
+}
