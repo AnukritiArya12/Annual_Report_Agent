@@ -28,6 +28,7 @@ from config import QuotaExhausted, get_llm, settings
 from knowledge import KnowledgeBase
 from schemas import (ChapterBlueprint, CompanyProfile, ReportBlueprint, ReportInput,
                      SourceDocument, TaskDefinition)
+from jurisdictions import get_jurisdiction
 from skills import SECTION_KINDS, DynamicReportArchitectSkill, CompanyIntelligenceSkill
 from tools import ResearchTools
 from utils import extract_json, slug
@@ -125,15 +126,18 @@ disclosure rules that really apply to this company in its country), reporting_fr
     def _confirm_profile(self, profile: CompanyProfile) -> CompanyProfile:
         """HUMAN CHECKPOINT 5 - the whole plan (chapters, regulations, segments) is built from this profile."""
         join = lambda xs: ", ".join(xs)
-        fields = {"industry": profile.industry, "country": profile.country, "ticker_or_id": profile.ticker_or_id or "",
-                  "listing_status": profile.listing_status, "reporting_framework": profile.reporting_framework,
+        resolved_j = get_jurisdiction(profile.country, profile)
+        fields = {"industry": profile.industry, "country": profile.country, "jurisdiction": resolved_j.code,
+                  "ticker_or_id": profile.ticker_or_id or "",
+                  "listing_status": profile.listing_status, "reporting_framework": profile.reporting_framework or resolved_j.regime_name,
                   "key_business_segments": join(profile.key_business_segments),
                   "geographic_presence": join(profile.geographic_presence),
-                  "applicable_regulations": join(profile.applicable_regulations),
+                  "applicable_regulations": join(profile.applicable_regulations or [resolved_j.governing_statute]),
                   "peer_competitors": join(profile.peer_competitors)}
         vals, changed = approvals.edit_fields(
-            "profile", "STEP 5 - CONFIRM THE COMPANY PROFILE (the report structure is designed from it)", fields,
-            info=[f"Company: {profile.company_name}", f"Summary: {(profile.business_model_summary or '-')[:300]}"])
+            "profile", "STEP 5 - CONFIRM THE COMPANY PROFILE & JURISDICTION", fields,
+            info=[f"Company: {profile.company_name} | Resolved Jurisdiction: {resolved_j.country_name} ({resolved_j.code})",
+                  f"Summary: {(profile.business_model_summary or '-')[:300]}"])
         update: Dict[str, Any] = {}
         for k in changed:                       # only edited fields are re-split; untouched ones keep their exact values
             v = vals[k].strip()
@@ -141,6 +145,10 @@ disclosure rules that really apply to this company in its country), reporting_fr
                 update[k] = [x.strip() for x in v.split(",") if x.strip()]
             elif k == "ticker_or_id":
                 update[k] = v or None
+            elif k == "jurisdiction":
+                j_override = get_jurisdiction(v)
+                update["country"] = vals.get("country") or j_override.country_name
+                update["reporting_framework"] = vals.get("reporting_framework") or j_override.regime_name
             else:
                 update[k] = v
         return profile.model_copy(update=update) if update else profile
@@ -170,18 +178,19 @@ disclosure rules that really apply to this company in its country), reporting_fr
     # -------------------------------------------------- 2. structure evidence
     def _structure_evidence(self, spec: ReportInput, profile: CompanyProfile, reference_toc: str) -> str:
         res = []
+        jurisdiction = get_jurisdiction(profile.country, profile)
         if reference_toc.strip():
             res.append("TABLE OF CONTENTS OF REFERENCE / PEER BENCHMARK REPORT (for chapter flow and industry topics):\n" + reference_toc)
         if profile.is_first_year:
+            rules = jurisdiction.first_year_rules
+            mand_sec = "\n".join(f"  * {s.title} ({s.kind}): {s.purpose}" for s in jurisdiction.mandatory_sections)
             res.append(
-                "FIRST-YEAR INAUGURAL ANNUAL REPORT STATUTORY & DEPARTMENTAL SPECIFICATION:\n"
-                "- Executive / CEO Office: Strategic Vision, Business Model, Genesis, Maiden Operational Milestones\n"
-                "- Secretarial & Governance Department: Statutory Board of Directors' Report under Companies Act 2013 Section 134 "
-                "(State of affairs, Section 173 Board meetings, Section 134(5) Directors' Responsibility Statement, "
-                "Section 135 CSR threshold evaluation, Section 188 Related Party Disclosures, Section 139 Auditor Appointment)\n"
-                "- Finance & Accounts Department: Schedule III Financial Statements (Balance Sheet, Statement of Profit & Loss, "
-                "Cash Flow Statement) with all preceding-period columns marked 'N/A (First Year of Operations)', "
-                "Significant Accounting Policies (Ind AS / AS), Notes to Accounts, and Statutory Auditor's Report (Section 143)"
+                f"FIRST-YEAR INAUGURAL ANNUAL REPORT SPECIFICATION ({jurisdiction.country_name} - {jurisdiction.regime_name}):\n"
+                f"- Governing Statute: {jurisdiction.governing_statute}\n"
+                f"- Comparative Data Rule: {rules.comparative_data_rule}\n"
+                f"- Governance & Secretarial Focus: {rules.statutory_governance_focus}\n"
+                f"- Mandatory Statutory Sections:\n{mand_sec}\n"
+                f"- Accounting Policies: {rules.notes_to_accounts_emphasis} (Framework: {', '.join(jurisdiction.accounting_frameworks)})"
             )
         if res:
             return "\n\n".join(res)

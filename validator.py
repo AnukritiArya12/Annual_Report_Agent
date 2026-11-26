@@ -24,11 +24,16 @@ class DynamicValidator:
         self.names: List[str] = []                 # approved names of THE company (set by main via set_company)
         self.excluded: List[str] = []
         self.entity_flags: Dict[str, list] = {}    # task_id -> [(name, key, reason)] found in the latest draft
+        self.ledger: Optional[Any] = None
 
     def set_company(self, names: List[str], excluded: List[str] = ()) -> None:
         self.names = [n for n in names if n]
         self.excluded = list(excluded)
         self.entity_flags = {}
+
+    def set_ledger(self, ledger: Optional[Any]) -> None:
+        """Attach verified FactsLedger for quantitative consistency validation."""
+        self.ledger = ledger
 
     # ------------------------------------------------------- other-company content
     def _foreign_entities(self, task: TaskDefinition, text: str, output: TaskOutput) -> List[str]:
@@ -96,6 +101,43 @@ class DynamicValidator:
                         f"and refer to the other section in a clause instead."]
         return []
 
+    def _ledger_consistency(self, text: str) -> List[str]:
+        """Flags draft numbers that contradict verified facts in the canonical facts ledger."""
+        if not self.ledger:
+            return []
+        issues: List[str] = []
+        try:
+            facts = [f for f in self.ledger.get_all_facts()
+                     if f.numeric_value is not None and getattr(f.status, "value", str(f.status)) != "CONFLICTING"]
+        except Exception:
+            return []
+        if not facts:
+            return []
+
+        lines = text.splitlines()
+        for fact in facts:
+            metric_term = fact.key.replace("_", " ").lower()
+            for line in lines:
+                l_lower = line.lower()
+                if metric_term in l_lower:
+                    line_nums = [float(n.replace(",", "")) for n in re.findall(r"\b\d+(?:,\d+)*(?:\.\d+)?\b", line)
+                                 if len(n.replace(".", "").replace(",", "")) >= 2]
+                    # Filter out standard 4-digit years
+                    line_nums = [n for n in line_nums if not (1900 <= n <= 2100 and n.is_integer())]
+                    if line_nums:
+                        matches_fact = any(abs(n - fact.numeric_value) < 0.01 * (abs(fact.numeric_value) + 1e-5)
+                                           for n in line_nums)
+                        if not matches_fact:
+                            main_digits = re.sub(r"[^\d]", "", str(int(abs(fact.numeric_value))))
+                            line_digits = re.sub(r"[^\d]", "", line)
+                            if len(main_digits) >= 2 and main_digits not in line_digits:
+                                issues.append(
+                                    f"Disagreement with Canonical Ledger: Draft reports '{line.strip()}' for {fact.key}, "
+                                    f"which contradicts verified canonical fact '{fact.value}' ({fact.period})."
+                                )
+                                break
+        return issues
+
     # ------------------------------------------------------------------ main
     def validate_task_output(self, task: TaskDefinition, output: TaskOutput,
                              completed_texts: Dict[str, str]) -> ValidationResult:
@@ -124,6 +166,7 @@ class DynamicValidator:
         issues += self._foreign_entities(task, text, output)
         issues += self._duplicates(task, text, completed_texts)
         issues += self._blank_table_cells(text)
+        issues += self._ledger_consistency(text)
 
         # Deterministic Financial Verification
         evidence_corpus = " ".join(e.text for e in output.evidence_used)

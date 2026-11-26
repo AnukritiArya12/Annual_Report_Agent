@@ -121,23 +121,23 @@ Loaded at the beginning of the reporting lifecycle before any document chunking,
 DECISION RULES & OPERATIONAL WORKFLOW:
 1. UNIVERSAL CORPORATE ENTITY RESOLUTION:
    - Differentiate commercial trade names/brands from legal filing entities (e.g., 'Google' -> 'Alphabet Inc.').
-   - Determine exact global identification codes (Ticker, CIK, CIN, LEI, ISIN, Companies House CRN) and primary stock exchange(s).
+   - Determine exact global identification codes (Ticker, CIK, CIN, LEI, ISIN, CRN) and primary stock exchange(s).
    - Identify parent companies, operating subsidiaries, and joint ventures; distinguish consolidated vs. standalone scope.
 2. JURISDICTION & REGULATORY REGIME IDENTIFICATION:
    - Identify the primary country of incorporation, listing domicile, and applicable corporate law.
-   - Map the mandatory disclosure regime across global jurisdictions (e.g. US SEC Form 10-K, UK Companies Act Strategic Report, India SEBI LODR / Companies Act / RBI, European CSRD/IFRS, Singapore SGX, Japan FSA).
-   - Identify the primary accounting framework (US GAAP, IFRS, Ind AS, UK FRS, local GAAP) and fiscal year convention.
+   - Map the mandatory disclosure regime and statutory sections of the resolved jurisdiction.
+   - Identify the primary accounting framework (e.g. US GAAP, IFRS, local GAAP) and fiscal year convention.
 3. SOURCE PROVENANCE VERIFICATION & THREE-DEPARTMENT INTERNAL DOSSIER:
    - For established entities with public filings: Verify that candidate filings match the target company.
    - For maiden/unlisted entities with zero online presence (Cold-Start): Ingest primary corporate records partitioned into three authentic company departments:
      (a) Executive / Founder & CEO Office: Mission, corporate vision, business model, inaugural milestones, strategic market trajectory.
-     (b) Finance & Accounts Department: Equity capitalization, funding rounds, trial balance, Schedule III / GAAP opening financial statements, operating expenses, cash & bank balances, accounting policies.
-     (c) Legal, Company Secretarial & Governance Department: Certificate of Incorporation, CIN, registered office, Board of Directors & KMP details, Board meetings (Section 173), statutory auditor appointment (Section 139), and statutory legal compliance status.
+     (b) Finance & Accounts Department: Equity capitalization, funding rounds, trial balance, opening financial statements under applicable GAAP, operating expenses, cash & bank balances, accounting policies.
+     (c) Legal, Company Secretarial & Governance Department: Official incorporation charter, registered identification number, registered office, Board of Directors & executive leadership details, statutory meetings held, statutory auditor appointment, and regulatory compliance status.
    - EXCLUDE any document belonging to peer competitors, external industry analyses, or independent subsidiaries unless consolidated.
 4. ARTICLE SELECTION & WEB CORPUS TRIAGING PROTOCOL (WHEN NO PDF REPORT EXISTS):
    - When relying on public articles and web intelligence, select and triage sources using a strict 5-filter hierarchy:
      (a) Entity Subject Focus: The article must be primarily ABOUT the target company, not competitors or casual mentions.
-     (b) Authoritative Publisher Tier: Prioritize regulatory announcements (SEC, BSE, NSE), company investor relations portals, and Tier-1 financial media (Reuters, Bloomberg, Economic Times, Mint, FT, WSJ) over blogs, syndicators, or forums.
+     (b) Authoritative Publisher Tier: Prioritize regulatory announcements, company investor relations portals, and Tier-1 financial media over blogs, syndicators, or forums.
      (c) Temporal Alignment: Prioritize articles reporting directly on the target financial period (e.g. FY 2024-25) over outdated multi-year archives.
      (d) Hard Quantitative Substance: Select articles disclosing audited figures (revenue, net profit, EBITDA, dividends, cash flow, debt) and governance facts over vague marketing PR.
      (e) Noise & Spam Elimination: Discard clickbait, career/recruitment ads, stock forums, and unverified rumour mills.
@@ -203,15 +203,15 @@ DECISION RULES & OPERATIONAL WORKFLOW:
      * PEER STRUCTURAL BENCHMARKING (OPTIONAL BUT RECOMMENDED):
        - When available or provided (--peer-report), benchmark against an established peer company's annual report in the same sector to identify authentic industry chapter taxonomy, thematic disclosure areas, and sector-specific operational KPIs.
        - STRICT ISOLATION: Use peer reports strictly for structural inspiration; NEVER copy or extrapolate peer financials or operational figures.
-     * MANDATORY STATUTORY SECTIONS UNDER CORPORATE LAW (e.g. INDIA COMPANIES ACT 2013):
-       - Section 134(3) Board's Report: State of affairs, number of board meetings (Section 173), Directors' Responsibility Statement under Section 134(5), contracts with related parties (Section 188), risk management policy.
-       - Section 129 & Schedule III Financial Statements: Balance Sheet, Statement of Profit & Loss, Cash Flow Statement; all comparative prior-period columns marked 'N/A (First Year of Operations)'.
-       - Section 135 CSR Applicability: Explicit threshold evaluation (Net Worth >= ₹500 Cr, Turnover >= ₹1000 Cr, Net Profit >= ₹5 Cr); if below thresholds, disclose: 'Not Applicable under Section 135(1)'.
-       - Section 143 Statutory Auditor's Report & Notes to Accounts: Note 1 Basis of Preparation for Initial Financial Period from incorporation date.
+     * MANDATORY STATUTORY SECTIONS UNDER RESOLVED JURISDICTION:
+       - Apply the mandatory sections of the resolved jurisdiction (Directors' / Management Report, state of corporate affairs, governance declarations, and risk oversight).
+       - Audited Financial Statements: Balance Sheet, Statement of Profit & Loss, Cash Flow Statement; all comparative prior-period columns marked 'N/A (First Year of Operations)' in accordance with the jurisdiction's first-year rules.
+       - Statutory Disclosures: Applicability evaluation for corporate social responsibility, sustainability, or governance committees under local thresholds; if below thresholds, disclose explicit non-applicability.
+       - Statutory Auditor's Report & Notes to Accounts: Note 1 Basis of Preparation for Initial Financial Period from incorporation date.
      * THREE-DEPARTMENT CONTENT HARMONIZATION:
        - CEO Office: Strategic Vision, Genesis & Inaugural Milestones.
        - Secretarial Team: Board Governance, Directors' Report, Statutory Compliances.
-       - Finance Team: Schedule III Financial Statements & Accounting Notes.
+       - Finance Team: Primary Financial Statements & Accounting Notes.
 5. CRITIQUE, PRUNING & REFINEMENT PROTOCOL:
    - Evaluate the synthesized structure with an autonomous critic pass:
      * PRUNE irrelevant chapters (e.g., no inventory/plant chapters for digital services; no banking capital adequacy for non-banks).

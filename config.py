@@ -101,6 +101,15 @@ class Settings:
 
     SQLITE_DB_NAME: str = os.getenv("SQLITE_DB_NAME", "evidence.db")
 
+    # --- Hybrid Retrieval & Reranking Settings -------------------------------
+    HYBRID_SEARCH: bool = _bool("HYBRID_SEARCH", True)
+    RRF_K: int = _int("RRF_K", 60)
+    RERANK: bool = _bool("RERANK", False)
+    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2").strip()
+    KEYWORD_TOP_N: int = _int("KEYWORD_TOP_N", 25)
+    VECTOR_TOP_N: int = _int("VECTOR_TOP_N", 25)
+    OCR_ENABLED: bool = _bool("OCR_ENABLED", True)
+
 
 settings = Settings()
 

@@ -28,6 +28,7 @@ from agent import GenericTaskExecutionAgent, RunContext
 from assembler import ReportAssembler
 from config import QuotaExhausted, active_model_label, get_llm, settings
 from knowledge import KnowledgeBase, ReferenceIngestor
+from ledger import FactsLedger
 from storage import DatabaseStorageEngine
 from planner import DynamicPlanningEngine
 from schemas import (ExecutionState, ReportInput, TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus)
@@ -77,6 +78,14 @@ class MainOrchestrator:
             else:
                 print(f"  Sources loaded: {', '.join(d.title for d in docs)}")
 
+        # ---- 1b. facts ledger (canonical metrics extraction)
+        print("\n>>> STEP 1b: CANONICAL FACTS LEDGER")
+        ledger = FactsLedger(storage=kb)
+        if not (self.resume and ledger.count_facts() > 0):
+            ledger.build_ledger(spec.company_name, spec.financial_year, spec.reporting_scope)
+        else:
+            print(f"  Resuming with existing facts ledger: {ledger.count_facts()} facts recorded.")
+
         # ---- 2. plan
         print("\n>>> STEP 2: DYNAMIC PLANNING")
         planner = DynamicPlanningEngine(tools=self.tools, kb=kb)
@@ -108,6 +117,23 @@ class MainOrchestrator:
             print("\nStopped before writing. Edit blueprint.json if needed, then run again with --resume.")
             return ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
 
+        # ---- HUMAN CHECKPOINT: Conflicting & Missing Core Facts Review
+        conflicts = ledger.get_conflicting_facts()
+        missing = ledger.get_missing_core_keys(spec.financial_year)
+        if conflicts or missing:
+            details = []
+            if conflicts:
+                details.append(f"CONFLICTING FACTS ({len(conflicts)} items detected across sources):")
+                for c in conflicts[:10]:
+                    details.append(f"  - {c.key} ({c.period}): '{c.value}' from {c.source_doc_id}")
+            if missing:
+                details.append(f"MISSING CORE METRICS for {spec.financial_year}: {', '.join(missing)}")
+            details.append("Writing will proceed using available canonical facts. Do you approve?")
+            if not approvals.confirm("facts_review", "CHECKPOINT: REVIEW CANONICAL FACTS & REPORTING GAPS",
+                                     details, default=True):
+                print("\nStopped to allow reviewing facts or providing supplementary documents. Run again with --resume.")
+                return ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
+
         # ---- 3. write + validate
         calls = len(blueprint.tasks) * (1 + (1 if settings.VALIDATE_WITH_LLM else 0))
         print(f"\n[Budget] Writing needs about {calls} LLM calls (more if sections are revised or expanded). "
@@ -115,8 +141,9 @@ class MainOrchestrator:
         print(f"\n>>> STEP 3: WRITING {len(blueprint.tasks)} SECTIONS "
               f"({len(stages)} stages, {settings.MAX_PARALLEL_WORKERS} parallel workers)")
         self.ctx = RunContext(blueprint=blueprint, kb=kb, tools=self.tools,
-                              draft_dir=os.path.join(self.run_dir, "drafts"))
+                              draft_dir=os.path.join(self.run_dir, "drafts"), ledger=ledger)
         self.validator = DynamicValidator()
+        self.validator.set_ledger(ledger)
         _names, _excluded = approvals.identity()
         self.validator.set_company(_names or [blueprint.company_profile.company_name], _excluded)
         state = ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
@@ -185,7 +212,7 @@ class MainOrchestrator:
         docx_file = os.path.join(self.run_dir, f"{rid}.docx")
         pdf_file = os.path.join(self.run_dir, f"{rid}.pdf")
         title = f"{blueprint.company_profile.company_name} - Annual Report {spec.financial_year}"
-        assembler.assemble_markdown(blueprint, state.task_outputs, md_file)
+        assembler.assemble_markdown(blueprint, state.task_outputs, md_file, ledger=ledger)
         for name, fn, path in (("DOCX", assembler.export_docx, docx_file), ("PDF", assembler.export_pdf, pdf_file)):
             try:
                 fn(md_file, path, title)

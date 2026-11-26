@@ -14,7 +14,8 @@ FILES = {
     "skills.py": "STYLE_GUIDES", "approvals.py": "class ApprovalAborted", "utils.py": "def foreign_entities",
 }
 PACKAGES = [("requests", "requests"), ("bs4", "beautifulsoup4"), ("ddgs", "ddgs"), ("pydantic", "pydantic"),
-            ("dotenv", "python-dotenv"), ("docx", "python-docx"), ("reportlab", "reportlab")]
+            ("dotenv", "python-dotenv"), ("docx", "python-docx"), ("reportlab", "reportlab"),
+            ("pytesseract", "pytesseract"), ("PIL", "pillow"), ("lxml", "lxml"), ("rank_bm25", "rank_bm25")]
 
 ok = True
 print(f"Folder: {HERE}\n\nFILES")

@@ -173,7 +173,8 @@ class ReportAssembler:
         return removed_p, removed_t
 
     # ---------------------------------------------------------------- markdown
-    def assemble_markdown(self, blueprint: ReportBlueprint, outputs: Dict[str, TaskOutput], out_file: str) -> str:
+    def assemble_markdown(self, blueprint: ReportBlueprint, outputs: Dict[str, TaskOutput], out_file: str,
+                          ledger: Optional[Any] = None) -> str:
         p, spec = blueprint.company_profile, blueprint.input_spec
         L: List[str] = []
         L.append(f"# {p.company_name} - Annual Report {spec.financial_year}")
@@ -254,6 +255,20 @@ class ReportAssembler:
             L.append(f"| {d.doc_id} | {d.title[:60]} | {d.fiscal_year or 'As Reported'} | ChromaDB + SQLite |")
         if not blueprint.reference_documents:
             L.append("| internal://default | Dynamic Research Dossier | Target Period | ChromaDB + SQLite |")
+
+        # Canonical Facts Ledger Appendix
+        if ledger is not None:
+            try:
+                facts = ledger.get_all_facts()
+                if facts:
+                    L.append("\n### Verified Facts Ledger (Canonical Quantitative Metrics)")
+                    L.append("| Metric | Reported Value | Period | Scope | Status | Source Document | Page | Chunk ID |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+                    for f in facts:
+                        page_str = str(f.page) if f.page is not None else "N/A"
+                        status_str = f.status.value if hasattr(f.status, "value") else str(f.status)
+                        L.append(f"| {f.key.replace('_', ' ').title()} | {f.value} | {f.period} | {f.scope} | {status_str} | {f.source_doc_id} | {page_str} | {f.chunk_id} |")
+            except Exception:
+                pass
         os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
         with open(out_file, "w", encoding="utf-8") as f:
             f.write("\n".join(L) + "\n")

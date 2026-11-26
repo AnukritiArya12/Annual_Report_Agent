@@ -38,6 +38,7 @@ class RunContext:
     kb: KnowledgeBase
     tools: ResearchTools
     draft_dir: str
+    ledger: Optional[Any] = None
     texts: Dict[str, str] = field(default_factory=dict)
     digests: Dict[str, str] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -343,6 +344,12 @@ class GenericTaskExecutionAgent:
                 "5. Always state the currency (USD, INR, etc.) and unit (millions, billions, crores) for every figure.\n"
                 "6. For multi-year comparison tables, fill each year column from the evidence — data for prior years may appear in notes or comparative columns.\n"
             )
+        canonical_block = ""
+        if getattr(self.ctx, "ledger", None):
+            canonical_block = self.ctx.ledger.format_canonical_block(task.search_queries or [task.title])
+            if canonical_block:
+                canonical_block = f"\n{canonical_block}\n"
+
         user = f"""PART TO WRITE: {' > '.join(task.path)}
 REPORT: {self.ctx.blueprint.company_profile.company_name} - {spec.financial_year} - {spec.reporting_scope}
 WHAT IT MUST COVER: {task.what_to_cover}
@@ -352,7 +359,7 @@ TARGET LENGTH: about {task.target_words} words
 
 REFERENCE DOCUMENTS AVAILABLE:
 {self.ctx.docs_note}
-
+{canonical_block}
 {self._scope_block(task)}
 
 EARLIER SECTIONS THIS PART BUILDS ON:

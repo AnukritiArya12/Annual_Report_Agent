@@ -17,14 +17,14 @@ An autonomous agent that synthesizes publication-grade annual reports for **any 
    - **Peer Benchmarking (`--peer-report`)**: Ingests established peer reports strictly for structural chapter taxonomy without copying peer financials.
    - **Three-Department Intake (`--first-year`, `--dossier`)**: Ingests primary corporate records from:
      1. Executive / CEO Office (Genesis, vision, milestones).
-     2. Finance & Accounts (Trial balance, capital structure, Schedule III statements).
-     3. Legal & Secretarial (CIN, Section 173 Board meetings, Section 139 auditor, Section 135 CSR).
+     2. Finance & Accounts (Trial balance, capital structure, statutory financial statements).
+     3. Legal & Secretarial (Corporate registration identifier, Board meetings, statutory auditor appointment, CSR/sustainability).
 4. **Deterministic Financial Verification (`financial.py`)**:
    - Audits tables for mathematical accuracy: checks row-sum totals ($A + B = \text{Total}$), uniform currency/scale ($₹\text{ Cr}$, $\$M$, $€M$), and balances.
 5. **5-Tier Audit Statuses (`schemas.py`, `validator.py`)**:
    - Classifies draft sections into `PASS`, `WARNING`, `REVIEW_REQUIRED`, `FAIL`, or `NOT_VERIFIABLE`.
 6. **Multi-Format Document Parsing (`knowledge.py`)**:
-   - Scanned PDF support with automatic OCR fallback.
+   - Scanned PDF support with automatic OCR fallback via PyMuPDF rendering and PyTesseract (requires pytesseract and system Tesseract-OCR binary; if unavailable, a clear warning is displayed and textual pages continue).
    - Native Word document (.docx) parsing with heading and table preservation.
 7. **Report Assembly & Auditability Appendix (`assembler.py`)**:
    - Generates publication-ready `.pdf` (ReportLab multiBuild with page-numbered TOC), `.docx` (Word TOC field), and `.md` with an automated **Auditability Register & Evidence Mapping** appendix.

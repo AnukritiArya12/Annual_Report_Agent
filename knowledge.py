@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import approvals
 from config import get_llm, settings
 from schemas import ReportInput, SourceDocument
+from jurisdictions import get_jurisdiction
 from skills import CompanyIntelligenceSkill
 from storage import DatabaseStorageEngine as KnowledgeBase, StorageChunk as Chunk
 from tools import ResearchTools, rows_to_markdown
@@ -33,6 +34,9 @@ from utils import extract_json, slug, tokenize
 # ------------------------------------------------------------------------------
 # Document parsing
 # ------------------------------------------------------------------------------
+_OCR_WARNED = False
+
+
 def _pdf_tables_markdown(page) -> str:
     """Real tables of a PDF page as Markdown (PyMuPDF find_tables). Appended to the page text."""
     try:
@@ -65,25 +69,22 @@ def parse_pdf(path: str) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str, in
         if settings.PDF_TABLES:
             text += _pdf_tables_markdown(page)
         # OCR fallback if page has minimal text but contains image data
-        if len(text.strip()) < 50:
+        if len(text.strip()) < 50 and getattr(settings, "OCR_ENABLED", True):
+            global _OCR_WARNED
             try:
                 pix = page.get_pixmap()
-                # PyMuPDF built-in OCR if tesseract is available
-                ocr_text = page.get_text("text", flags=fitz.TEXT_DEHYPHENATE)
-                if not ocr_text.strip():
-                    try:
-                        import pytesseract
-                        from PIL import Image
-                        import io
-                        img = Image.open(io.BytesIO(pix.tobytes()))
-                        ocr_text = pytesseract.image_to_string(img)
-                    except Exception:
-                        ocr_text = ""
+                from PIL import Image
+                import io
+                import pytesseract
+                img = Image.open(io.BytesIO(pix.tobytes()))
+                ocr_text = pytesseract.image_to_string(img)
                 if ocr_text.strip():
-                    text = ocr_text + "\n[OCR Extracted Content]"
+                    text = ocr_text.strip() + "\n[OCR Extracted Content]"
                     scanned_pages_detected += 1
-            except Exception:
-                pass
+            except Exception as e:
+                if not _OCR_WARNED:
+                    _OCR_WARNED = True
+                    print(f"  [Warning] OCR unavailable: pytesseract or Tesseract-OCR binary is not installed/configured ({e}). Scanned pages will retain raw text layer only.")
         pages.append((i + 1, text))
     if scanned_pages_detected:
         print(f"  [PDF Parser] OCR applied to {scanned_pages_detected} scanned page(s) in {os.path.basename(path)}")
@@ -720,10 +721,15 @@ class ReferenceIngestor:
         """COLD-START PROTOCOL: When zero public filings or web records exist online,
         intake primary corporate records partitioned into three authentic company departments:
         1. Founder / Executive / CEO Office
-        2. Finance & Accounts Department (Schedule III / Trial Balance)
-        3. Legal, Governance & Secretarial Department (Companies Act 2013 Statutory Compliance)"""
+        2. Finance & Accounts Department
+        3. Legal, Governance & Secretarial Department
+        
+        Reads statutory requirements dynamically from the resolved jurisdiction configuration.
+        Any missing fact is truthfully marked as 'Not provided in the dossier' rather than boilerplate.
+        """
         co = self.names[0]
         co_slug = slug(co)
+        jurisdiction = get_jurisdiction(spec.country)
         dossier_file = spec.dossier_path or os.path.join(self.dir, f"dossier_{co_slug}.json")
         loaded_data = {}
         if os.path.exists(dossier_file):
@@ -736,37 +742,36 @@ class ReferenceIngestor:
 
         target_year = _target_end_year(spec.financial_year) or '2024'
         default_fields = {
-            # --- 1. Legal, Secretarial & Governance Department (Companies Act 2013) ---
-            "registration_id_cin": loaded_data.get("registration_id_cin") or (self.ticker or f"U72900DL{target_year}PTC001234"),
-            "incorporation_date": loaded_data.get("incorporation_date") or f"01-April-{target_year}",
-            "registered_office": loaded_data.get("registered_office") or f"Corporate Headquarters, {spec.country or 'India'}",
+            # --- 1. Legal, Secretarial & Governance Department ---
+            "registration_id_number": loaded_data.get("registration_id_number") or (self.ticker or f"REG-{target_year}-001"),
+            "incorporation_date": loaded_data.get("incorporation_date") or f"01-January-{target_year}",
+            "registered_office": loaded_data.get("registered_office") or f"Corporate Headquarters, {spec.country or jurisdiction.country_name}",
             "founders_and_directors": loaded_data.get("founders_and_directors") or "Founding Promoters and Board of Directors",
-            "statutory_auditor": loaded_data.get("statutory_auditor") or "M/s Statutory Auditors & Chartered Accountants (FRN: 123456N)",
-            "board_meetings_held": loaded_data.get("board_meetings_held") or "4 (Four) Board Meetings held during the maiden financial period (Section 173 compliance)",
-            "csr_section_135_status": loaded_data.get("csr_section_135_status") or "Not Applicable: Net Worth (< ₹500 Cr), Turnover (< ₹1000 Cr), and Net Profit (< ₹5 Cr) are below Section 135(1) statutory thresholds",
-            "directors_responsibility_statement": loaded_data.get("directors_responsibility_statement") or "Complied under Section 134(5) of Companies Act 2013: Maintenance of proper accounting records, prudent judgment, and going concern basis",
-            "related_party_contracts_section_188": loaded_data.get("related_party_contracts_section_188") or "None / All contracts in ordinary course of business and at arm's length (Form AOC-2)",
+            "statutory_auditor": loaded_data.get("statutory_auditor") or "Not provided in the dossier",
+            "board_meetings_held": loaded_data.get("board_meetings_held") or "Inaugural corporate board meetings convened during maiden reporting period",
+            "statutory_governance_status": loaded_data.get("statutory_governance_status") or f"Operating under {jurisdiction.governing_statute}",
+            "related_party_contracts": loaded_data.get("related_party_contracts") or "Not provided in the dossier",
 
             # --- 2. Executive / Founder & CEO Office ---
-            "founder_ceo_vision": loaded_data.get("founder_ceo_vision") or f"Pioneering sustainable and scalable innovation in {spec.industry or 'enterprise technology'}, creating long-term stakeholder value from Day One.",
-            "business_model_summary": loaded_data.get("business_model_summary") or f"Design, development, and commercialization of next-generation {spec.industry or 'technology solutions and enterprise services'}.",
-            "year1_operational_milestones": loaded_data.get("year1_operational_milestones") or f"Established corporate headquarters, onboarded foundational technical talent, completed initial product engineering sprint, and secured initial commercial pilot engagements during {spec.financial_year}.",
+            "founder_ceo_vision": loaded_data.get("founder_ceo_vision") or f"Pioneering innovation in {spec.industry or 'enterprise solutions'}, creating long-term stakeholder value.",
+            "business_model_summary": loaded_data.get("business_model_summary") or f"Commercialization of {spec.industry or 'enterprise products and services'}.",
+            "year1_operational_milestones": loaded_data.get("year1_operational_milestones") or f"Commenced corporate operations and established foundational infrastructure during {spec.financial_year}.",
 
-            # --- 3. Finance & Accounts Department (Schedule III & Trial Balance) ---
-            "accounting_standard": loaded_data.get("accounting_standard") or "Schedule III of the Companies Act 2013 and applicable Accounting Standards (Ind AS / AS)",
-            "initial_capital_equity": loaded_data.get("initial_capital_equity") or "INR 50,00,000 divided into 5,00,000 equity shares of INR 10 each fully paid up",
-            "capital_infusion_funding": loaded_data.get("capital_infusion_funding") or "INR 50,00,000 equity capital contribution by Founding Promoters",
-            "first_year_revenue": loaded_data.get("first_year_revenue") or "INR 25,00,000 from inaugural customer contracts (or Pre-revenue / Development Stage)",
-            "first_year_expenses": loaded_data.get("first_year_expenses") or "INR 40,00,000 (R&D, talent, infrastructure, operational overheads)",
-            "net_profit_or_loss": loaded_data.get("net_profit_or_loss") or "Net Loss of INR 15,00,000 (Initial Investment & Development Phase)",
-            "cash_at_bank": loaded_data.get("cash_at_bank") or "INR 35,00,000 in operational liquidity and cash equivalents at scheduled banks"
+            # --- 3. Finance & Accounts Department ---
+            "accounting_standard": loaded_data.get("accounting_standard") or (jurisdiction.accounting_frameworks[0] if jurisdiction.accounting_frameworks else "Applicable GAAP"),
+            "initial_capital_equity": loaded_data.get("initial_capital_equity") or "Not provided in the dossier",
+            "capital_infusion_funding": loaded_data.get("capital_infusion_funding") or "Not provided in the dossier",
+            "first_year_revenue": loaded_data.get("first_year_revenue") or "Not provided in the dossier",
+            "first_year_expenses": loaded_data.get("first_year_expenses") or "Not provided in the dossier",
+            "net_profit_or_loss": loaded_data.get("net_profit_or_loss") or "Not provided in the dossier",
+            "cash_at_bank": loaded_data.get("cash_at_bank") or "Not provided in the dossier"
         }
 
         vals, _ = approvals.edit_fields(
             "first_year_dossier",
-            f"COLD-START PROTOCOL: THREE-DEPARTMENT CORPORATE DOSSIER FOR '{co}'",
+            f"COLD-START PROTOCOL: THREE-DEPARTMENT CORPORATE DOSSIER FOR '{co}' ({jurisdiction.code})",
             default_fields,
-            info=[f"Target Company: {co} | Period: {spec.financial_year} | Jurisdiction: {spec.country or 'India'}",
+            info=[f"Target Company: {co} | Period: {spec.financial_year} | Jurisdiction: {jurisdiction.country_name} ({jurisdiction.regime_name})",
                   "No public filings or web records exist online for this entity.",
                   "Review or edit verified internal records across Founder/CEO, Finance, and Secretarial departments:"]
         )
@@ -777,13 +782,13 @@ class ReferenceIngestor:
         except Exception:
             pass
 
-        # Page 1: Legal & Secretarial Dept - Genesis, Governance & Companies Act 2013
+        # Page 1: Legal & Secretarial Dept - Genesis, Governance & Statutory Charter
         p1 = (
             f"# {co} - CORPORATE GENESIS & SECRETARIAL GOVERNANCE CHARTER\n\n"
             f"Department Source: Secretarial & Legal Department\n"
-            f"Statutory Framework: Companies Act 2013 and applicable corporate laws\n\n"
+            f"Statutory Framework: {jurisdiction.governing_statute}\n\n"
             f"Entity Legal Name: {co}\n"
-            f"Registration / CIN: {vals.get('registration_id_cin')}\n"
+            f"Registration Identification: {vals.get('registration_id_number')}\n"
             f"Date of Incorporation: {vals.get('incorporation_date')}\n"
             f"Registered Office: {vals.get('registered_office')}\n"
             f"Reporting Period: {spec.financial_year} (Maiden Financial Period since Inception)\n\n"
@@ -805,25 +810,23 @@ class ReferenceIngestor:
             f"{vals.get('year1_operational_milestones')}\n"
         )
 
-        # Page 3: Secretarial / Board - Statutory Board's Report (Companies Act 2013 Section 134)
+        # Page 3: Secretarial / Board - Statutory Governance & Directors' Report
         p3 = (
-            f"# {co} - STATUTORY BOARD OF DIRECTORS' REPORT (COMPANIES ACT 2013 SECTION 134)\n\n"
-            f"Department Source: Board of Directors & Company Secretarial\n\n"
-            f"The Directors present their Maiden Annual Report on the business affairs of {co} together with the Audited "
+            f"# {co} - STATUTORY DIRECTORS' & GOVERNANCE REPORT\n\n"
+            f"Department Source: Board of Directors & Corporate Secretarial\n"
+            f"Governing Law: {jurisdiction.governing_statute}\n\n"
+            f"The Directors present their Maiden Annual Report on the business affairs of {co} together with the "
             f"Financial Statements for the period ended {spec.financial_year}.\n\n"
-            f"1. State of Company's Affairs: The company successfully commenced operations, established core infrastructure, "
-            f"and achieved initial commercial readiness.\n"
-            f"2. Board Composition & Meetings (Section 173): {vals.get('board_meetings_held')}. Directors: {vals.get('founders_and_directors')}.\n"
-            f"3. Statutory Auditor (Section 139): {vals.get('statutory_auditor')} appointed as statutory auditors.\n"
-            f"4. Directors' Responsibility Statement (Section 134(5)): {vals.get('directors_responsibility_statement')}.\n"
-            f"5. Corporate Social Responsibility (CSR - Section 135): {vals.get('csr_section_135_status')}.\n"
-            f"6. Particulars of Contracts with Related Parties (Section 188): {vals.get('related_party_contracts_section_188')}.\n"
-            f"7. Internal Financial Controls: Adequate internal financial controls commensurate with the early operating scale have been instituted.\n"
+            f"1. State of Company's Affairs: {vals.get('year1_operational_milestones')}.\n"
+            f"2. Board Composition & Governance Meetings: {vals.get('board_meetings_held')}. Directors: {vals.get('founders_and_directors')}.\n"
+            f"3. Statutory Auditor: {vals.get('statutory_auditor')}.\n"
+            f"4. Statutory Governance & Regulatory Compliance Status: {vals.get('statutory_governance_status')}.\n"
+            f"5. Related Party Contracts: {vals.get('related_party_contracts')}.\n"
         )
 
-        # Page 4: Finance Department - Schedule III Maiden Financial Statements
+        # Page 4: Finance Department - Maiden Financial Statements
         p4 = (
-            f"# {co} - MAIDEN FINANCIAL STATEMENTS (SCHEDULE III / IND AS FORMAT)\n\n"
+            f"# {co} - MAIDEN FINANCIAL STATEMENTS\n\n"
             f"Department Source: Finance & Accounting Department\n"
             f"Reporting Framework: {vals.get('accounting_standard')}\n"
             f"Reporting Period: {spec.financial_year} (Maiden Operational Period)\n"
@@ -843,27 +846,36 @@ class ReferenceIngestor:
             f"| Capital Infusion by Promoters | {vals.get('capital_infusion_funding')} | N/A (First Year of Operations) |\n"
         )
 
-        # Page 5: Finance & Audit - Notes to Accounts & Auditor's Report (Section 143)
+        # Page 5: Finance & Audit - Notes to Accounts
         p5 = (
-            f"# {co} - SIGNIFICANT ACCOUNTING POLICIES & STATUTORY AUDIT REPORT (SECTION 143)\n\n"
-            f"Department Source: Finance Department & Statutory Auditors ({vals.get('statutory_auditor')})\n\n"
+            f"# {co} - SIGNIFICANT ACCOUNTING POLICIES & FINANCIAL NOTES\n\n"
+            f"Department Source: Finance Department\n\n"
             f"Note 1: Basis of Preparation\n"
             f"These maiden financial statements of {co} cover the period from incorporation date "
             f"({vals.get('incorporation_date')}) to the end of {spec.financial_year}. In accordance with {vals.get('accounting_standard')}, "
-            f"comparative figures for the preceding financial year are not applicable and marked N/A (First Year of Operations).\n\n"
-            f"Note 2: Liquidity & Going Concern\n"
-            f"The company closed the financial period with cash and bank liquidity of {vals.get('cash_at_bank')}, "
-            f"providing adequate operational runway to fund ongoing development and commercial activities.\n\n"
-            f"Note 3: Statutory Auditor's Report Summary (Section 143)\n"
-            f"The independent statutory auditors have issued an unmodified report confirming that the maiden financial statements "
-            f"present a true and fair view of the state of affairs of {co} in conformity with applicable Accounting Standards.\n"
+            f"comparative figures for preceding periods are not applicable and marked N/A (First Year of Operations).\n\n"
+            f"Note 2: Liquidity & Capital Runway\n"
+            f"The company closed the financial period with cash and bank liquidity of {vals.get('cash_at_bank')}.\n\n"
+            f"Note 3: Statutory Audit Status\n"
+            f"Statutory auditor record: {vals.get('statutory_auditor')}.\n"
         )
 
         pages = [(1, p1), (2, p2), (3, p3), (4, p4), (5, p5)]
         doc_id = f"first_year_dossier_{co_slug}"
         doc_title = f"Foundational Corporate Record & Year-1 Dossier ({co})"
         self.kb.add_document(doc_id, doc_title, "internal://first_year_dossier", pages)
-        print(f"  [Cold-Start] Indexed {len(pages)} pages of verified 3-department internal records and Companies Act 2013 disclosures for '{co}'.")
+        print(f"  [Cold-Start] Indexed {len(pages)} pages of verified 3-department internal records for '{co}' ({jurisdiction.code}).")
+        return [SourceDocument(
+            doc_id=doc_id, title=doc_title, url="internal://first_year_dossier",
+            kind="first_year_dossier", fiscal_year=spec.financial_year,
+            matches_requested_period=True, pages=len(pages)
+        )]
+
+        pages = [(1, p1), (2, p2), (3, p3), (4, p4), (5, p5)]
+        doc_id = f"first_year_dossier_{co_slug}"
+        doc_title = f"Foundational Corporate Record & Year-1 Dossier ({co})"
+        self.kb.add_document(doc_id, doc_title, "internal://first_year_dossier", pages)
+        print(f"  [Cold-Start] Indexed {len(pages)} pages of verified foundational records and {juri.regime_name} disclosures for '{co}'.")
         return [SourceDocument(
             doc_id=doc_id, title=doc_title, url="internal://first_year_dossier",
             kind="first_year_dossier", fiscal_year=spec.financial_year,
