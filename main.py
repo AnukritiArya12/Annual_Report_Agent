@@ -28,8 +28,9 @@ from agent import GenericTaskExecutionAgent, RunContext
 from assembler import ReportAssembler
 from config import QuotaExhausted, active_model_label, get_llm, settings
 from knowledge import KnowledgeBase, ReferenceIngestor
+from storage import DatabaseStorageEngine
 from planner import DynamicPlanningEngine
-from schemas import (ExecutionState, ReportInput, TaskDefinition, TaskOutput, TaskStatus, ValidationResult)
+from schemas import (ExecutionState, ReportInput, TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus)
 from tools import ResearchTools
 from utils import SPARSE_MARK, foreign_entities, slug, word_count
 from validator import DynamicValidator
@@ -43,7 +44,6 @@ class MainOrchestrator:
         os.makedirs(run_dir, exist_ok=True)
         approvals.configure(run_dir, auto=getattr(settings, "AUTO_APPROVE", False), reset=not resume)
         self.tools = ResearchTools(run_dir=run_dir)
-        self.kb_path = os.path.join(run_dir, "kb.json")
         self.print_lock = threading.Lock()
 
     # --------------------------------------------------------------------- run
@@ -58,18 +58,18 @@ class MainOrchestrator:
 
         # ---- 1. knowledge base (the company's real report(s))
         print("\n>>> STEP 1: LOADING REFERENCE DOCUMENTS")
+        storage_engine = DatabaseStorageEngine(run_dir=self.run_dir)
         planner_resume = self.resume and os.path.exists(os.path.join(self.run_dir, "blueprint.json")) \
-            and os.path.exists(self.kb_path)
+            and storage_engine.total_chunks() > 0
         if planner_resume:
-            kb = KnowledgeBase.load(self.kb_path)
-            print(f"  Resuming: knowledge base with {len(kb.chunks)} chunks loaded.")
+            kb = storage_engine
+            print(f"  Resuming: database with {kb.total_chunks()} persistent chunks loaded.")
             docs, reference_toc = [], ""
         else:
             shutil.rmtree(os.path.join(self.run_dir, "drafts"), ignore_errors=True)
-            kb = KnowledgeBase()
+            kb = storage_engine
             ingestor = ReferenceIngestor(self.tools, kb, self.run_dir)
             docs = ingestor.ingest(spec)
-            kb.save(self.kb_path)
             reference_toc = ingestor.contents.get("peer_toc") or (ingestor.contents.get(docs[0].doc_id, "") if docs else "")
             if not docs:
                 print("  WARNING: the agent found no source documents at all (see the [Ingest] lines above for why). "
@@ -156,6 +156,9 @@ class MainOrchestrator:
         # ---- HUMAN CHECKPOINT: other-company content in the written sections
         self._entity_review(blueprint, state)
 
+        # ---- HUMAN CHECKPOINT: Risk-Based Financial Discrepancy & Regulatory Uncertainty Review
+        self._risk_based_review(blueprint, state)
+
         # ---- summary stats
         words = sum(word_count(o.markdown_content) for o in state.task_outputs.values())
         failed = [blueprint.get_task(i).title for i, o in state.task_outputs.items() if o.status == TaskStatus.FAILED]
@@ -216,6 +219,67 @@ class MainOrchestrator:
             print("  Re-run the same command with --resume to retry only the failed sections.")
         print("=" * 72 + "\n")
         return state
+
+    def _risk_based_review(self, blueprint, state: ExecutionState) -> None:
+        """Risk-based human review for:
+        1. Arithmetic & financial verification failures.
+        2. Regulatory framework uncertainty.
+        3. Missing critical disclosures or conflicting source metrics."""
+        tasks = {t.task_id: t for t in blueprint.tasks}
+        
+        # 1. Identify Financial Verification Discrepancies
+        math_issues = []
+        for tid, val in state.validation_results.items():
+            if val.status == ValidationStatus.FAIL:
+                math_errs = [i for i in val.issues_found if "Arithmetic mismatch" in i or "ungrounded" in i]
+                if math_errs:
+                    math_issues.append((tasks[tid].title, math_errs))
+
+        if math_issues and not approvals.is_auto():
+            lines = ["The following sections contain financial figure mismatches or arithmetic discrepancies:"]
+            for title, errs in math_issues[:5]:
+                lines.append(f"  * {title}: {errs[0]}")
+            lines.append("You may approve proceeding with cautionary notes, or abort to revise.")
+            approvals.confirm(
+                "risk_financial_discrepancy",
+                "RISK CHECKPOINT - ARITHMETIC / FINANCIAL VERIFICATION ALERT",
+                lines,
+                default=True
+            )
+
+        # 2. Regulatory & Critical Disclosure Uncertainty Review
+        profile = blueprint.company_profile
+        if not profile.applicable_regulations or profile.industry == "Unknown":
+            if not approvals.is_auto():
+                approvals.confirm(
+                    "risk_regulatory_uncertainty",
+                    "RISK CHECKPOINT - REGULATORY / STATUTORY UNCERTAINTY",
+                    [
+                        f"Company: {profile.company_name} | Country: {profile.country or 'Unknown'}",
+                        f"Industry: {profile.industry} | Framework: {profile.reporting_framework or 'Not Disclosed'}",
+                        "Applicable statutory corporate laws could not be unambiguously resolved from online public sources.",
+                        "Confirm to proceed using general global corporate disclosure standards, or abort to provide statutory details."
+                    ],
+                    default=True
+                )
+
+        # 3. Missing Critical Disclosures (Sparse sections)
+        sparse_critical = [
+            tasks[tid].title for tid, out in state.task_outputs.items()
+            if out.sparse and tasks[tid].kind in ("financial_statement", "statutory")
+        ]
+        if sparse_critical and not approvals.is_auto():
+            approvals.confirm(
+                "risk_missing_critical",
+                "RISK CHECKPOINT - MISSING CRITICAL STATUTORY / FINANCIAL DISCLOSURES",
+                [
+                    f"The following critical sections could not find official data in public sources ({len(sparse_critical)}):",
+                    *[f"  - {t}" for t in sparse_critical[:6]],
+                    "These sections will be published with explicit 'Not Disclosed in Sources Reviewed' disclaimers.",
+                    "Approve proceeding to publication, or provide relevant internal records via --pdf?"
+                ],
+                default=True
+            )
 
     # ----------------------------------------------------------------- helpers
     def _write_outline(self, bp) -> None:

@@ -11,7 +11,8 @@ from typing import Dict, List
 
 import approvals
 from config import QuotaExhausted, get_llm, settings
-from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult
+from financial import FinancialVerifier
+from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus
 from skills import REVIEW_GUIDANCE
 from utils import extract_json, foreign_entities, shingle_set, word_count
 
@@ -99,10 +100,16 @@ class DynamicValidator:
     def validate_task_output(self, task: TaskDefinition, output: TaskOutput,
                              completed_texts: Dict[str, str]) -> ValidationResult:
         issues: List[str] = []
+        warnings: List[str] = []
+        reconciled: List[str] = []
+
         if output.status == TaskStatus.FAILED:
-            return ValidationResult(target_id=task.task_id, is_valid=False,
-                                    issues_found=[output.error_message or "generation failed"],
-                                    revision_instructions=None)
+            return ValidationResult(
+                target_id=task.task_id, status=ValidationStatus.FAIL, is_valid=False,
+                issues_found=[output.error_message or "generation failed"],
+                revision_instructions=None
+            )
+
         text = output.markdown_content.strip()
         words = word_count(text)
         strong_evidence = len(output.evidence_used) >= 6
@@ -118,6 +125,14 @@ class DynamicValidator:
         issues += self._duplicates(task, text, completed_texts)
         issues += self._blank_table_cells(text)
 
+        # Deterministic Financial Verification
+        evidence_corpus = " ".join(e.text for e in output.evidence_used)
+        fin_audit = FinancialVerifier.audit_draft_financials(text, evidence_corpus)
+        if not fin_audit.is_valid:
+            issues.extend(fin_audit.errors)
+        warnings.extend(fin_audit.warnings)
+        reconciled.extend(fin_audit.reconciled_items)
+
         for criterion in task.validation_criteria:
             if any(w in criterion.lower() for w in ("table", "matrix")):
                 rows = [l for l in text.splitlines() if l.strip().startswith("|")]
@@ -128,11 +143,26 @@ class DynamicValidator:
         if not issues and settings.VALIDATE_WITH_LLM and task.validation_criteria:
             issues += self._llm_review(task, output, text)
 
-        ok = not issues
+        # Assign Graded Status
+        if issues:
+            status = ValidationStatus.FAIL if any("Arithmetic" in i or "ungrounded" in i for i in issues) else ValidationStatus.REVIEW_REQUIRED
+            ok = False
+        elif warnings:
+            status = ValidationStatus.WARNING
+            ok = True
+        elif not output.evidence_used:
+            status = ValidationStatus.NOT_VERIFIABLE
+            ok = True
+        else:
+            status = ValidationStatus.PASS
+            ok = True
+
         revision = None if ok else "Revise this section to resolve:\n" + "\n".join(f"- {i}" for i in issues)
-        print(f"[Validator] {'PASS' if ok else 'REVISE'} '{task.title}'" + ("" if ok else f": {issues}"))
-        return ValidationResult(target_id=task.task_id, is_valid=ok, issues_found=issues,
-                                revision_instructions=revision)
+        print(f"[Validator] [{status.value}] '{task.title}'" + ("" if ok else f": {issues}"))
+        return ValidationResult(
+            target_id=task.task_id, status=status, is_valid=ok, issues_found=issues,
+            warnings=warnings, reconciled_items=reconciled, revision_instructions=revision
+        )
 
     def _llm_review(self, task: TaskDefinition, output: TaskOutput, text: str) -> List[str]:
         evid = "\n".join(f"[{i+1}] {e.text[:350]}" for i, e in enumerate(output.evidence_used[:8]))

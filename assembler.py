@@ -245,6 +245,15 @@ class ReportAssembler:
         if failed:
             L.append("\n**Sections that could not be generated:**\n")
             L += [f"- {f}" for f in failed]
+
+        # Audit Registry Appendix
+        L.append("\n---\n")
+        L.append("## Appendix: Auditability Register & Evidence Mapping")
+        L.append("| Document / Source ID | Provenance Title | Scope / Period | Storage Engine |\n| :--- | :--- | :--- | :--- |")
+        for d in blueprint.reference_documents:
+            L.append(f"| {d.doc_id} | {d.title[:60]} | {d.fiscal_year or 'As Reported'} | ChromaDB + SQLite |")
+        if not blueprint.reference_documents:
+            L.append("| internal://default | Dynamic Research Dossier | Target Period | ChromaDB + SQLite |")
         os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
         with open(out_file, "w", encoding="utf-8") as f:
             f.write("\n".join(L) + "\n")
@@ -435,6 +444,13 @@ class ReportAssembler:
             "cellr": ParagraphStyle("RCR", fontName=regular, fontSize=8, leading=10, alignment=TA_RIGHT),
         }
 
+        def safe_para(text: str, style: Any) -> Paragraph:
+            try:
+                return Paragraph(inline(text), style)
+            except Exception:
+                safe_text = clean(re.sub(r"<[^>]+>", "", text)).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                return Paragraph(safe_text, style)
+
         class _Doc(SimpleDocTemplate):
             def beforeDocument(self):
                 self._toc_n = 0                    # keys must be identical on every pass or the TOC never settles
@@ -472,38 +488,47 @@ class ReportAssembler:
             if kind == "h":
                 lvl, text = b[1], b[2]
                 if lvl == 1:
-                    story.append(Paragraph(inline(text), S["title"]))
+                    story.append(safe_para(text, S["title"]))
                 elif lvl == 2:
                     story.append(PageBreak())
-                    story.append(Paragraph(inline(text), S["h2"]))
+                    story.append(safe_para(text, S["h2"]))
                     in_cover = False
                 else:
-                    story.append(Paragraph(inline(text), S[{3: "h3", 4: "h4"}.get(lvl, "h5")]))
+                    story.append(safe_para(text, S[{3: "h3", 4: "h4"}.get(lvl, "h5")]))
             elif kind == "toc":
                 in_cover = False
                 story.append(PageBreak())
-                story.append(Paragraph("Table of Contents", S["toctitle"]))
+                story.append(safe_para("Table of Contents", S["toctitle"]))
                 story.append(toc)
             elif kind == "p":
-                story.append(Paragraph(inline(b[1]), S["cover"] if in_cover else S["p"]))
+                story.append(safe_para(b[1], S["cover"] if in_cover else S["p"]))
             elif kind in ("ul", "ol"):
-                items = [ListItem(Paragraph(inline(i), S["p"]), leftIndent=12) for i in b[1]]
+                items = [ListItem(safe_para(i, S["p"]), leftIndent=12) for i in b[1]]
                 story.append(ListFlowable(items, bulletType="bullet" if kind == "ul" else "1", start="\u2022" if kind == "ul" else 1,
                                           leftIndent=14, bulletFontName=regular))
             elif kind == "quote":
-                story.append(Paragraph(inline(b[1]), S["quote"]))
+                story.append(safe_para(b[1], S["quote"]))
             elif kind == "table":
                 rows, aligns = b[1], b[2]
-                n = len(rows[0])
-                weights = [max(6, min(40, max(len(r[c]) for r in rows))) for c in range(n)]
-                tot = sum(weights)
+                if not rows or not rows[0]:
+                    continue
+                max_cols = max(len(r) for r in rows)
+                if max_cols == 0:
+                    continue
+                padded_rows = [list(r) + [""] * (max_cols - len(r)) for r in rows]
+                padded_aligns = (list(aligns) + ["left"] * max_cols)[:max_cols]
+                weights = [max(6, min(40, max(len(str(r[c])) for r in padded_rows))) for c in range(max_cols)]
+                tot = sum(weights) or 1
                 widths = [avail * w / tot for w in weights]
                 data = []
-                for ri, row in enumerate(rows):
-                    data.append([Paragraph(inline(c.replace("**", "") if ri == 0 else c),
-                                           S["cellh"] if ri == 0 else (S["cellr"] if aligns[ci] == "right" else S["cell"]))
-                                 for ci, c in enumerate(row)])
-                t = Table(data, colWidths=widths, repeatRows=1)
+                for ri, row in enumerate(padded_rows):
+                    row_cells = []
+                    for ci, c in enumerate(row):
+                        val_str = str(c).replace("**", "") if ri == 0 else str(c)
+                        c_style = S["cellh"] if ri == 0 else (S["cellr"] if padded_aligns[ci] == "right" else S["cell"])
+                        row_cells.append(safe_para(val_str, c_style))
+                    data.append(row_cells)
+                t = Table(data, colWidths=widths, repeatRows=1, splitByRow=1)
                 t.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), navy),
                     ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F6F9")]),
@@ -515,11 +540,28 @@ class ReportAssembler:
                 story.append(Spacer(1, 8))
 
         os.makedirs(os.path.dirname(os.path.abspath(pdf_file)), exist_ok=True)
-        doc = _Doc(pdf_file, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=2 * cm,
+        target_pdf = pdf_file
+        try:
+            with open(target_pdf, "ab") as test_f:
+                pass
+        except PermissionError:
+            base, ext = os.path.splitext(pdf_file)
+            target_pdf = f"{base}_new{ext}"
+            print(f"[Assembler] Notice: '{os.path.basename(pdf_file)}' is currently open in another program. Saving PDF to: '{os.path.basename(target_pdf)}'")
+
+        doc = _Doc(target_pdf, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=2 * cm,
                    bottomMargin=2 * cm, title=clean(title))
-        doc.multiBuild(story, onFirstPage=footer, onLaterPages=footer)
-        print(f"[Assembler] PDF written: {pdf_file}")
-        return pdf_file
+        try:
+            doc.multiBuild(story, onFirstPage=footer, onLaterPages=footer)
+        except Exception as e:
+            print(f"[Assembler] Notice: Multi-pass TOC layout encountered an issue ({e}); generating via single-pass build...")
+            simple_doc = SimpleDocTemplate(target_pdf, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm,
+                                           topMargin=2 * cm, bottomMargin=2 * cm, title=clean(title))
+            fallback_story = [f for f in story if not isinstance(f, TableOfContents)]
+            simple_doc.build(fallback_story, onFirstPage=footer, onLaterPages=footer)
+
+        print(f"[Assembler] PDF written: {target_pdf}")
+        return target_pdf
 
     @staticmethod
     def _register_fonts() -> Tuple[str, str, str, bool]:

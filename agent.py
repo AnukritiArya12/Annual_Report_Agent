@@ -41,7 +41,7 @@ class RunContext:
     texts: Dict[str, str] = field(default_factory=dict)
     digests: Dict[str, str] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
-    used_chunks: Dict[int, int] = field(default_factory=dict)   # chunk_id -> how many sections already use it
+    used_chunks: Dict[str, int] = field(default_factory=dict)   # chunk_id -> how many sections already use it
 
     def __post_init__(self):
         os.makedirs(self.draft_dir, exist_ok=True)
@@ -159,7 +159,7 @@ class GenericTaskExecutionAgent:
                 f"{co} income tax provision effective tax rate deferred tax",
                 f"{co} share capital authorized issued outstanding",
             ]
-        best: Dict[int, Tuple[object, float]] = {}
+        best: Dict[str, Tuple[object, float]] = {}
         for q in queries:
             for ch, sc in self.ctx.kb.search(q, k=k):
                 if ch.chunk_id not in best or sc > best[ch.chunk_id][1]:

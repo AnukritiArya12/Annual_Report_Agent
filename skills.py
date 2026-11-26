@@ -119,13 +119,14 @@ INVOCATION & APPLICABILITY:
 Loaded at the beginning of the reporting lifecycle before any document chunking, indexing, or structural planning.
 
 DECISION RULES & OPERATIONAL WORKFLOW:
-1. CORPORATE ENTITY RESOLUTION:
+1. UNIVERSAL CORPORATE ENTITY RESOLUTION:
    - Differentiate commercial trade names/brands from legal filing entities (e.g., 'Google' -> 'Alphabet Inc.').
-   - Determine exact identification codes (Ticker, CIK, CIN, LEI, ISIN) and primary stock exchange(s).
+   - Determine exact global identification codes (Ticker, CIK, CIN, LEI, ISIN, Companies House CRN) and primary stock exchange(s).
+   - Identify parent companies, operating subsidiaries, and joint ventures; distinguish consolidated vs. standalone scope.
 2. JURISDICTION & REGULATORY REGIME IDENTIFICATION:
    - Identify the primary country of incorporation, listing domicile, and applicable corporate law.
-   - Map the mandatory disclosure regime (e.g. US SEC Form 10-K, UK Companies Act Strategic Report, India SEBI LODR / Companies Act / RBI, European CSRD/IFRS).
-   - Identify the primary accounting framework (US GAAP, IFRS, Ind AS, local GAAP) and fiscal year convention.
+   - Map the mandatory disclosure regime across global jurisdictions (e.g. US SEC Form 10-K, UK Companies Act Strategic Report, India SEBI LODR / Companies Act / RBI, European CSRD/IFRS, Singapore SGX, Japan FSA).
+   - Identify the primary accounting framework (US GAAP, IFRS, Ind AS, UK FRS, local GAAP) and fiscal year convention.
 3. SOURCE PROVENANCE VERIFICATION & THREE-DEPARTMENT INTERNAL DOSSIER:
    - For established entities with public filings: Verify that candidate filings match the target company.
    - For maiden/unlisted entities with zero online presence (Cold-Start): Ingest primary corporate records partitioned into three authentic company departments:
@@ -140,9 +141,10 @@ DECISION RULES & OPERATIONAL WORKFLOW:
      (c) Temporal Alignment: Prioritize articles reporting directly on the target financial period (e.g. FY 2024-25) over outdated multi-year archives.
      (d) Hard Quantitative Substance: Select articles disclosing audited figures (revenue, net profit, EBITDA, dividends, cash flow, debt) and governance facts over vague marketing PR.
      (e) Noise & Spam Elimination: Discard clickbait, career/recruitment ads, stock forums, and unverified rumour mills.
-5. HUMAN SUPERVISION GATE:
+5. HUMAN SUPERVISION & RISK GATES:
    - Present the resolved legal entity, identifiers, primary jurisdiction, and verified source documents for human confirmation.
    - Present candidate web articles with their relevance scores and domains for explicit human selection (Checkpoint 4b) before indexing.
+   - Trigger risk-based reviews whenever company identity is ambiguous or regulatory framework cannot be determined.
 
 RECOVERY STRATEGIES:
 - If automated regulatory filing retrieval fails, transition to the company's official Investor Relations web portal.
@@ -260,14 +262,15 @@ DECISION RULES & OPERATIONAL WORKFLOW:
    - Never describe external competitors or third parties as if they were part of the reporting company.
    - PEER BENCHMARK FIREWALL: Even if a peer company's annual report was consulted as a structural benchmark (--peer-report), NEVER quote peer financial numbers, peer executives, or peer operations. All numbers and statements must come solely from the target company's evidence.
    - External entities (statutory auditors, regulators, key technology partners, credit rating agencies) may be mentioned ONLY when explicitly named in the evidence in an external capacity.
-4. METRIC & UNIT INTEGRITY:
-   - Always state currency and scale (e.g. ₹ Crore, US$ Millions, € Millions) for every figure reported in narrative and tables.
+4. METRIC, SCALE & ARITHMETIC INTEGRITY:
+   - Always state currency and scale (e.g. ₹ Crore, US$ Millions, € Millions, £ Thousands) for every figure reported in narrative and tables.
+   - Component line items in financial tables MUST arithmetically sum to reported totals (Assets = Liabilities + Equity; Segment sum = Total Revenue).
 5. FIRST-YEAR COMPARATIVE DATA PROTOCOL:
    - In multi-year comparative tables or financial statements for a first-year reporting entity, prior-period columns MUST be filled with 'N/A (First Year)' or 'N/A (Initial Period)'.
    - NEVER leave prior-period cells blank or marked 'Not Disclosed'. State explicitly that preceding period figures are not applicable due to maiden operational period.
 6. RECOVERY & VALIDATION PROTOCOL:
    - If evidence retrieved for a section is thin, execute targeted live queries or clearly document the disclosure gap.
-   - If a draft is rejected by validation (e.g. for empty table cells or ungrounded claims), revise the section immediately by eliminating the offending content and adding explicit disclosure notices."""
+   - If a draft is rejected by validation (e.g. for empty table cells, arithmetic mismatch, or ungrounded claims), revise the section immediately by eliminating the offending content and adding explicit disclosure notices."""
 
     @classmethod
     def get_instructions(cls) -> str:
@@ -278,12 +281,20 @@ DECISION RULES & OPERATIONAL WORKFLOW:
 # REVIEWER SKILL (Used by Validator)
 # ---------------------------------------------------------------------------
 REVIEW_GUIDANCE = (
-    "VALIDATION & AUDIT RULES:\n"
-    "1. ZERO BLANK CELLS: Reject any output containing Markdown tables with empty cells ('| |' or '|   |'). Every cell must contain valid data or 'Not Disclosed'.\n"
-    "2. NUMERIC GROUNDING: Reject any specific financial figure, percentage, or date that contradicts or is missing from the evidence.\n"
-    "3. ENTITY ISOLATION: Reject any text describing external companies, competitors, or third parties as part of the reporting company.\n"
-    "4. DISCLOSURE COMPLIANCE: An honest 'Not Disclosed in Sources Reviewed' satisfies an ungrounded requirement and must NOT be failed.\n"
-    "5. ACTIONABLE REVISION: Return precise, corrective instructions pointing out exact discrepancies for single-pass remediation."
+    "STRICT FIVE-STATUS AUDIT RULES:\n"
+    "Judge the section draft across factual accuracy, mathematical consistency, and evidence fidelity.\n"
+    "Classify output into one of the 5 authoritative statuses:\n"
+    "1. PASS: 100% of facts and figures are grounded in evidence. All table sums and reconciliations are arithmetically exact. Zero blank cells.\n"
+    "2. WARNING: Grounded and factually truthful, but contains minor non-blocking issues (e.g. mixed currency notations, slightly short word count).\n"
+    "3. REVIEW_REQUIRED: Factual claims require human confirmation (e.g. unfamiliar subsidiary mention, conflicting dates, or section under 40 words).\n"
+    "4. FAIL: Mathematical reconciliation errors (e.g. row sum does not equal reported total), ungrounded financial numbers absent from evidence, or blank table cells ('| |').\n"
+    "5. NOT_VERIFIABLE: Material is completely absent from all retrieved evidence sources and marked 'Not Disclosed in Sources Reviewed'.\n\n"
+    "CRITICAL AUDIT RULES:\n"
+    "- NEVER mark unverified or contradictory financial work as PASS.\n"
+    "- ZERO BLANK CELLS: Reject any output containing Markdown tables with empty cells ('| |' or '|   |').\n"
+    "- NUMERIC & MATHEMATICAL GROUNDING: Reject any financial figure or calculation that contradicts evidence or table component totals.\n"
+    "- ENTITY ISOLATION: Reject any text describing external competitors or third parties as part of the reporting company.\n"
+    "- ACTIONABLE REVISION: Return precise, corrective instructions pointing out exact discrepancies for single-pass remediation."
 )
 
 

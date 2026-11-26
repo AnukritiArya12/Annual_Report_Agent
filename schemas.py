@@ -149,10 +149,21 @@ class TaskOutput(BaseModel):
     sparse: bool = False        # True when the section had no usable evidence
 
 
+class ValidationStatus(str, Enum):
+    PASS = "PASS"
+    WARNING = "WARNING"
+    FAIL = "FAIL"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    NOT_VERIFIABLE = "NOT_VERIFIABLE"
+
+
 class ValidationResult(BaseModel):
     target_id: str
-    is_valid: bool
+    status: ValidationStatus = ValidationStatus.PASS
+    is_valid: bool = True
     issues_found: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    reconciled_items: List[str] = Field(default_factory=list)
     revision_instructions: Optional[str] = None
     verified_at: datetime = Field(default_factory=_now)
 
