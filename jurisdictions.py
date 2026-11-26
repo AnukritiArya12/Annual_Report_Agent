@@ -268,3 +268,201 @@ def get_jurisdiction(country: Optional[str] = None, profile: Optional[Any] = Non
                 return j_cfg
 
     return JURISDICTION_REGISTRY["GENERIC"]
+
+
+@dataclass
+class IndustryBenchmark:
+    """Standard reporting structure, KPIs, and disclosure requirements for an industry sector."""
+    sector_name: str
+    recommended_chapters: List[str]
+    key_metrics_and_kpis: List[str]
+    specific_risk_factors: List[str]
+    peer_structure_notes: str
+
+
+INDUSTRY_SECTOR_BENCHMARKS: Dict[str, IndustryBenchmark] = {
+    "banking": IndustryBenchmark(
+        sector_name="Banking, Financial Institutions & Lending",
+        recommended_chapters=[
+            "Corporate Overview & Banking Franchise",
+            "Executive Leadership & Strategic Priorities",
+            "Macroeconomic Environment & Monetary Policy Impact",
+            "Credit Risk, Asset Quality & Provisioning (GNPA / NNPA)",
+            "Capital Adequacy & Basel III Disclosures (CET1, Tier 1, CAR)",
+            "Treasury, Investment Portfolio & Net Interest Margin (NIM)",
+            "Liquidity Risk Management (LCR & NSFR)",
+            "Digital Banking, Payments & Technology Infrastructure",
+            "Financial Highlights & Core Banking Metrics",
+            "Audited Financial Statement Highlights (Balance Sheet, P&L, Cash Flow)",
+            "Notes to Accounts & Regulatory Capital Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Net Interest Margin (NIM)", "Return on Assets (ROA)", "Return on Equity (ROE)",
+            "Gross NPA Ratio", "Net NPA Ratio", "Provision Coverage Ratio (PCR)",
+            "Capital Adequacy Ratio (CAR / CRAR)", "Cost-to-Income Ratio",
+            "CASA Ratio", "Liquidity Coverage Ratio (LCR)"
+        ],
+        specific_risk_factors=[
+            "Credit default risk and systemic loan book concentration",
+            "Interest rate volatility and yield curve shifts",
+            "Regulatory compliance, capital conservation buffers, and central bank directives",
+            "Cybersecurity threats on digital payment gateways and core banking switches"
+        ],
+        peer_structure_notes="Peer banks prioritize credit quality schedules, NPA movement, asset liability matching (ALM), and Basel III regulatory capital tables."
+    ),
+    "technology": IndustryBenchmark(
+        sector_name="Technology, Software, SaaS & IT Services",
+        recommended_chapters=[
+            "Corporate Profile, Vision & Innovation Charter",
+            "CEO & Board Strategic Review",
+            "Market Opportunity, Total Addressable Market (TAM) & Ecosystem",
+            "Product Portfolio, Cloud Platforms & Architecture",
+            "Operational Performance & Go-To-Market Traction",
+            "Research & Development (R&D) & Intellectual Property",
+            "Human Capital, Talent Engineering & Developer Retention",
+            "Cybersecurity, Privacy, Data Governance & AI Ethics",
+            "Financial Performance & Highlights",
+            "Statement Highlights (Balance Sheet, Income Statement, Cash Flow)",
+            "Accounting Disclosures & Canonical Facts Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Annual Recurring Revenue (ARR)", "Net Revenue Retention (NRR)",
+            "Gross Margin", "R&D as % of Revenue", "Customer Acquisition Cost (CAC)",
+            "Lifetime Value (LTV)", "Active Users / Subscription Scale", "EBITDA Margin"
+        ],
+        specific_risk_factors=[
+            "Rapid technological obsolescence and generative AI disruption",
+            "Cloud infrastructure concentration and platform outage exposure",
+            "Data privacy regulation (GDPR, CCPA) and cybersecurity breaches",
+            "Competition for specialist engineering talent and compensation inflation"
+        ],
+        peer_structure_notes="Peer technology firms emphasize ARR metrics, customer expansion rates, cloud infrastructure efficiency, R&D capitalization policies, and IP portfolios."
+    ),
+    "manufacturing": IndustryBenchmark(
+        sector_name="Manufacturing, Industrial & Automotive",
+        recommended_chapters=[
+            "Enterprise Profile, Manufacturing Footprint & Global Facilities",
+            "Chairman & Leadership Operational Message",
+            "Industrial Industry Trends & Raw Material Dynamics",
+            "Manufacturing Operations, Plant Utilization & Production Capacity",
+            "Supply Chain Resilience, Logistics & Strategic Sourcing",
+            "Product Quality, Safety & Lean Engineering",
+            "Environmental Sustainability, Emissions & Energy Transition",
+            "Workforce Health, Safety & Operational Governance",
+            "Financial Performance & Highlights",
+            "Financial Summary Tables (Balance Sheet, P&L, Cash Flow)",
+            "Statutory Notes & Canonical Ledger Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Production Output / Installed vs Utilized Capacity", "Gross Margin",
+            "EBITDA Margin", "Inventory Turnover Days", "Order Book / Backlog",
+            "Capital Expenditure (CapEx)", "Lost Time Injury Frequency Rate (LTIFR)",
+            "Carbon / Energy Intensity per unit produced"
+        ],
+        specific_risk_factors=[
+            "Raw material commodity price volatility and supply chain disruption",
+            "Factory downtime, machine failure, and labor disputes",
+            "Environmental compliance, carbon tax, and emissions mandates",
+            "Cyclical demand slowdown in industrial and consumer end-markets"
+        ],
+        peer_structure_notes="Peer manufacturers emphasize plant capacity utilization, CapEx modernization projects, inventory cycle management, and health & safety metrics."
+    ),
+    "healthcare": IndustryBenchmark(
+        sector_name="Healthcare, Pharmaceuticals & Biotechnology",
+        recommended_chapters=[
+            "Company Profile, Therapeutic Areas & Patient Mission",
+            "Executive Leadership Review",
+            "Therapeutic Market Dynamics & Clinical Need",
+            "R&D Pipeline, Clinical Trials & Development Milestones",
+            "Regulatory Approvals, Pharmacovigilance & Compliance",
+            "Manufacturing Quality (cGMP), Supply Chain & Distribution",
+            "Commercial Portfolio & Market Penetration",
+            "Intellectual Property, Patent Portfolio & Expiry Schedules",
+            "Financial Results & Capital Allocation",
+            "Audited Statement Highlights",
+            "Canonical Ledger & Clinical Governance Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "R&D Pipeline Phase I/II/III Assets", "R&D Spend as % of Revenue",
+            "Top Drug / Product Concentration", "Patent Expiry Timeline",
+            "Regulatory Inspection Clearance Rate", "Gross Margin", "Operating Margin"
+        ],
+        specific_risk_factors=[
+            "Clinical trial failures or efficacy endpoints not met",
+            "Regulatory rejection or delay (FDA, EMA, national regulators)",
+            "Patent expirations and generic pricing erosion",
+            "Product liability, pharmacovigilance recalls, and litigation"
+        ],
+        peer_structure_notes="Peer pharmaceutical reports dedicate substantial depth to pipeline progression, patent protection cliffs, and regulatory inspection compliance."
+    ),
+    "retail": IndustryBenchmark(
+        sector_name="Retail, Consumer Goods & E-Commerce",
+        recommended_chapters=[
+            "Brand Profile, Customer Proposition & Market Reach",
+            "Leadership Review & Omnichannel Strategy",
+            "Consumer Macro Environment & Spending Trends",
+            "Omnichannel Network, Store Operations & Digital Platforms",
+            "Merchandising, Private Labels & Supply Chain Logistics",
+            "Customer Engagement, Loyalty Programs & Retention",
+            "Sustainability, Ethical Sourcing & Packaging",
+            "Financial Highlights & Store Economics",
+            "Audited Statement Highlights",
+            "Canonical Ledger Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Same-Store Sales Growth (SSSG)", "Average Order Value (AOV)",
+            "Store Footprint / Retail Area (Sq. Ft.)", "Inventory Days",
+            "Digital / Online Sales Contribution %", "Gross Margin", "EBITDA Margin"
+        ],
+        specific_risk_factors=[
+            "Consumer discretionary spending contraction",
+            "Freight and logistics cost inflation",
+            "Inventory markdowns and seasonal unsold stock write-offs",
+            "Intense competition from pure-play e-commerce and price-matching"
+        ],
+        peer_structure_notes="Peer consumer reports emphasize same-store growth, store expansion plans, digital mix percentages, and working capital efficiency."
+    ),
+    "generic": IndustryBenchmark(
+        sector_name="General Corporate Enterprise",
+        recommended_chapters=[
+            "Corporate Profile, Vision & Operating Model",
+            "Executive Review & Strategic Priorities",
+            "Operational Review & Key Business Segments",
+            "Corporate Governance & Leadership Structure",
+            "Risk Management & Internal Control Framework",
+            "Financial Performance & Key Financial Metrics",
+            "Deterministic Financial Statement Highlights",
+            "Canonical Facts Ledger & Audit Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Total Revenue", "Operating Profit / EBITDA", "Net Profit",
+            "Total Assets", "Shareholders Equity", "Cash & Cash Equivalents"
+        ],
+        specific_risk_factors=[
+            "Macroeconomic demand fluctuation and competitive pressures",
+            "Operational execution and cost management",
+            "Regulatory compliance and governance"
+        ],
+        peer_structure_notes="Standard general corporate reporting structure focusing on operating review, governance, and audited financial statements."
+    )
+}
+
+
+def get_industry_benchmark(sector_or_industry: Optional[str] = None) -> IndustryBenchmark:
+    """Resolve the industry reporting benchmark, typical peer chapters, and KPIs for any sector."""
+    if not sector_or_industry:
+        return INDUSTRY_SECTOR_BENCHMARKS["generic"]
+    
+    sec_clean = sector_or_industry.strip().lower()
+    if any(k in sec_clean for k in ("bank", "finance", "lending", "credit", "nbf", "loan")):
+        return INDUSTRY_SECTOR_BENCHMARKS["banking"]
+    if any(k in sec_clean for k in ("tech", "software", "saas", "it", "cloud", "digital", "data", "robotics", "ai", "hardware")):
+        return INDUSTRY_SECTOR_BENCHMARKS["technology"]
+    if any(k in sec_clean for k in ("manufactur", "auto", "industrial", "steel", "engineering", "cement", "chemical")):
+        return INDUSTRY_SECTOR_BENCHMARKS["manufacturing"]
+    if any(k in sec_clean for k in ("pharma", "health", "biotech", "drug", "medicine", "clinical", "hospital")):
+        return INDUSTRY_SECTOR_BENCHMARKS["healthcare"]
+    if any(k in sec_clean for k in ("retail", "consumer", "ecommerce", "fmcg", "store", "apparel", "food")):
+        return INDUSTRY_SECTOR_BENCHMARKS["retail"]
+
+    return INDUSTRY_SECTOR_BENCHMARKS["generic"]

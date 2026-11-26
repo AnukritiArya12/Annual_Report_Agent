@@ -21,15 +21,15 @@ def get_connectors_for_jurisdiction(jurisdiction: JurisdictionConfig,
     """Resolve active official source discovery connectors for a jurisdiction."""
     connectors: List[SourceConnector] = []
     code = getattr(jurisdiction, "code", "").upper()
-    sources = [s.lower() for s in getattr(jurisdiction, "official_sources", [])]
+    sources = {s.lower() for s in getattr(jurisdiction, "official_sources", [])}
 
-    if code == "US" or any("sec" in s or "edgar" in s for s in sources):
+    if code == "US" or "sec.gov" in sources or "edgar" in sources:
         connectors.append(SecEdgarConnector(tools=tools, run_dir=run_dir))
 
-    if code == "IN" or any("bse" in s or "nse" in s or "mca" in s for s in sources):
+    if code == "IN" or "bseindia.com" in sources or "nseindia.com" in sources or "mca.gov.in" in sources:
         connectors.append(IndiaBseNseConnector(tools=tools, run_dir=run_dir))
 
-    if code == "UK" or any("companies-house" in s or "londonstockexchange" in s for s in sources):
+    if code in ("UK", "GB") or "companies-house.gov.uk" in sources or "londonstockexchange.com" in sources:
         connectors.append(CompaniesHouseConnector(tools=tools, run_dir=run_dir))
 
     # Generic IR crawler active for EU, SG, JP, GENERIC and as supplemental source

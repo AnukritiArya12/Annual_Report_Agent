@@ -7,15 +7,33 @@ acceptance criteria come from the planner, per section.
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 import approvals
 from config import QuotaExhausted, get_llm, settings
 from financial import FinancialVerifier
 from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus
-from skills import REVIEW_GUIDANCE, ValidationAndQualitySkill
 from statements import get_statement_for_task
 from utils import extract_json, foreign_entities, shingle_set, word_count
+
+REVIEW_GUIDANCE = (
+    "FIVE-STATUS AUDIT RULES — classify this draft into exactly one status:\n\n"
+    "PASS           : All facts grounded in EVIDENCE or CANONICAL FACTS. "
+    "All table sums exact. Zero blank cells. No canonical fact contradicted.\n"
+    "WARNING        : Grounded and truthful but minor non-blocking issues "
+    "(mixed currency notation, slightly short, minor style).\n"
+    "REVIEW_REQUIRED: Human confirmation needed — unfamiliar org name, conflicting dates, "
+    "number disagrees with a canonical ledger fact, section under 40 words, "
+    "pre-built financial table unavailable.\n"
+    "FAIL           : Arithmetic mismatch (sum ≠ total), number absent from evidence AND "
+    "not in canonical facts, blank table cell ('| |'), or canonical fact contradicted.\n"
+    "NOT_VERIFIABLE : Material absent from all evidence; marked 'Not Disclosed in Sources "
+    "Reviewed'. Nothing to validate against.\n\n"
+    "NEVER mark contradictory or unverified work as PASS.\n"
+    "NEVER accept blank table cells.\n"
+    "NEVER accept a number that contradicts a REPORTED canonical fact without flagging it.\n"
+    "ALWAYS return precise, corrective instructions for single-pass remediation."
+)
 
 
 class DynamicValidator:
@@ -202,7 +220,11 @@ class DynamicValidator:
 
         # Assign Graded Status
         if issues:
-            status = ValidationStatus.FAIL if any("Arithmetic" in i or "ungrounded" in i for i in issues) else ValidationStatus.REVIEW_REQUIRED
+            status = ValidationStatus.FAIL if any(
+                "Arithmetic" in i or "do not appear" in i or "ungrounded" in i.lower()
+                or "Disagreement with Canonical Ledger" in i or "discrepancy" in i.lower()
+                for i in issues
+            ) else ValidationStatus.REVIEW_REQUIRED
             ok = False
         elif warnings:
             status = ValidationStatus.WARNING
@@ -224,9 +246,8 @@ class DynamicValidator:
     def _llm_review(self, task: TaskDefinition, output: TaskOutput, text: str) -> List[str]:
         evid = "\n".join(f"[{i+1}] {e.text[:350]}" for i, e in enumerate(output.evidence_used[:8]))
         system = (
-            ValidationAndQualitySkill.get_instructions() + "\n\n"
             "You are a strict annual-report audit reviewer. Judge ONLY the two things asked. "
-            "Return ONLY JSON: {\"verdict\": \"PASS\" | \"FAIL\", \"issues\": [\"...\"]}.\n"
+            "Return ONLY JSON: {\"verdict\": \"PASS\" | \"FAIL\", \"issues\": [\"...\"]}.\n\n"
             + REVIEW_GUIDANCE
         )
         user = f"""Section: {task.title}

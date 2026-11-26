@@ -38,7 +38,7 @@ class FinancialStatementBuilder:
 
         curr_prefix = f"{currency} " if currency else ""
         lines = [
-            f"| Statement of Financial Position (Balance Sheet) | Period: {period} | Verification Status |",
+            f"| Key Balance Sheet Highlights (Summary from Canonical Facts) | Period: {period} | Verification Status |",
             "| :--- | :--- | :--- |"
         ]
         if assets:
@@ -75,7 +75,7 @@ class FinancialStatementBuilder:
 
         curr_prefix = f"{currency} " if currency else ""
         lines = [
-            f"| Statement of Profit and Loss (Income Statement) | Period: {period} | Verification Status |",
+            f"| Key Income Statement Highlights (Summary from Canonical Facts) | Period: {period} | Verification Status |",
             "| :--- | :--- | :--- |"
         ]
         if rev:
@@ -102,7 +102,7 @@ class FinancialStatementBuilder:
 
         curr_prefix = f"{currency} " if currency else ""
         lines = [
-            f"| Statement of Cash Flows & Liquidity Position | Period: {period} | Verification Status |",
+            f"| Key Liquidity & Capital Highlights (Summary from Canonical Facts) | Period: {period} | Verification Status |",
             "| :--- | :--- | :--- |"
         ]
         if cash:

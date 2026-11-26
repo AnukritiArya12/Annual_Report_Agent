@@ -18,7 +18,6 @@ from connectors.registry import get_connectors_for_jurisdiction
 from financial import FinancialVerifier
 from jurisdictions import get_jurisdiction, JURISDICTION_REGISTRY
 from ledger import FactsLedger, FactRecord, FactStatus
-from planner import DynamicPlanningEngine
 from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationStatus
 from statements import FinancialStatementBuilder, get_statement_for_task
 from storage import DatabaseStorageEngine
@@ -434,35 +433,21 @@ class TestUpgradedAnnualReportAgent(unittest.TestCase):
         self.assertTrue(hasattr(all_charts[0], "source_line"))
 
     def test_evidence_based_capacity_calibration(self):
-        """Test evidence capacity estimation and page downscaling logic."""
-        import sqlite3
-        from config import settings
-        
-        # Setup dummy SQLite database imitating knowledge base chunks
-        kb_db = os.path.join(self.test_run_dir, "kb_test.db")
-        with sqlite3.connect(kb_db) as conn:
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE chunks (text TEXT, is_table INTEGER)")
-            # Insert 400 words (4 chunks of 100 words each)
-            chunk_text = " ".join(["word"] * 100)
-            for i in range(4):
-                cur.execute("INSERT INTO chunks VALUES (?, ?)", (chunk_text, 1 if i == 0 else 0))
-            conn.commit()
+        """Test evidence capacity estimation and page scaling logic via retrieval tools."""
+        import json
+        from tools import ReportSession
+        from tools.retrieval_tools import build_retrieval_tools
 
-        class DummyKB:
-            def __init__(self, path):
-                self.db_path = path
+        # Ingest test document into real storage
+        pages = [(1, " ".join(["evidence_word"] * 400))]
+        self.storage.add_document("doc_cap", "Cap Test", "http://cap.test", pages)
 
-        dummy_kb = DummyKB(kb_db)
-        planner = DynamicPlanningEngine(tools=None, kb=dummy_kb)
-        
-        ev_words, ev_tables, supported_pages = planner.estimate_evidence_capacity()
-        self.assertEqual(ev_words, 400)
-        self.assertEqual(ev_tables, 1)
-        
-        # Expected supported pages: 400 * 2.5 = 1000 words. At 300 words/page -> 3 pages.
-        expected_pages = max(1, int(400 * getattr(settings, "EVIDENCE_WORDS_RATIO", 2.5)) // settings.WORDS_PER_PAGE)
-        self.assertEqual(supported_pages, expected_pages)
+        session = ReportSession(run_dir=self.test_run_dir, company_name="TestCo", financial_year="FY 2024", storage=self.storage)
+        r_tools = build_retrieval_tools(session)
+        cap_tool = next(t for t in r_tools if t.name == "get_evidence_capacity")
+        res = json.loads(cap_tool.invoke({}))
+        self.assertGreaterEqual(res["total_evidence_words"], 400)
+        self.assertGreater(res["supported_pages_estimate"], 0)
 
 
 if __name__ == "__main__":

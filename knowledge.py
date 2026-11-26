@@ -26,7 +26,6 @@ from config import get_llm, settings
 from schemas import ReportInput, SourceDocument
 from jurisdictions import get_jurisdiction
 from connectors import get_connectors_for_jurisdiction, SecEdgarConnector
-from skills import CompanyIntelligenceSkill
 from storage import DatabaseStorageEngine as KnowledgeBase, StorageChunk as Chunk
 from tools import ResearchTools, rows_to_markdown
 from utils import extract_json, sanitize_untrusted, slug, tokenize
@@ -261,7 +260,7 @@ class ReferenceIngestor:
         self.names = [spec.company_name]
         try:
             system = (
-                f"{CompanyIntelligenceSkill.get_instructions()}\n\n"
+                "You are a corporate intelligence agent. Identify the governing legal entity, listed parent, statutory ID, and jurisdiction.\n\n"
                 "You identify which legal entity publishes a company's annual report. Return ONLY JSON."
             )
             user = (f'Name given by the user: "{spec.company_name}" (country: {spec.country or "unknown"}).\n'

@@ -58,17 +58,22 @@ class SecEdgarConnector(SourceConnector):
                             rec.get("reportDate", []), rec.get("filingDate", [])))
             annual = [r for r in rows if r[0] in ("10-K", "20-F", "40-F", "10-K405") and r[2]]
 
-            # Target year extraction
-            m_year = re.search(r"\b(20\d\d)\b", fy)
-            target_year = m_year.group(1) if m_year else ""
+            # Target year extraction (handle non-calendar fiscal years e.g. FY 2024 ending Jan 2025)
+            years_in_fy = re.findall(r"\b(20\d\d)\b", fy)
+            target_years = set(years_in_fy)
+            if len(years_in_fy) == 1:
+                # For e.g. "FY 2024" where fiscal year ends Jan/Feb/Mar 2025
+                target_years.add(str(int(years_in_fy[0]) + 1))
 
-            for form, acc, doc, rep, filed in annual[:5]:
+            for form, acc, doc, rep, filed in annual[:8]:
                 doc_year = str(rep)[:4]
+                doc_month = int(str(rep)[5:7]) if len(str(rep)) >= 7 and str(rep)[5:7].isdigit() else 12
                 url = f"https://www.sec.gov/Archives/edgar/data/{int(cik10)}/{acc.replace('-', '')}/{doc}"
                 title = f"{best.get('title', company)} Form {form} (Period ended {rep}, filed {filed})"
 
-                matches_fy = (target_year and doc_year == target_year)
-                confidence = 0.95 if matches_fy else 0.75
+                exact_match = (years_in_fy and doc_year == years_in_fy[-1])
+                off_cal_match = (len(years_in_fy) == 1 and doc_year == str(int(years_in_fy[0]) + 1) and doc_month <= 3)
+                confidence = 0.95 if (exact_match or off_cal_match) else 0.75
 
                 candidates.append(CandidateDocument(
                     url=url,
@@ -79,7 +84,7 @@ class SecEdgarConnector(SourceConnector):
                     raw_data={"cik": cik10, "form": form, "accession": acc, "reportDate": rep, "filingDate": filed,
                               "registrant": best.get("title")}
                 ))
-
-            return candidates
+            candidates.sort(key=lambda c: -c.confidence)
+            return candidates[:5]
         except Exception:
             return []

@@ -120,6 +120,14 @@ class Settings:
     MIN_EVIDENCE_WORDS_PER_PAGE: int = _int("MIN_EVIDENCE_WORDS_PER_PAGE", 150)
     COMPANIES_HOUSE_API_KEY: str = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
     CHARTS_ENABLED: bool = _bool("CHARTS_ENABLED", True)
+    EXTRA_ORG_NAMES: Tuple[str, ...] = (
+        "microsoft", "google", "amazon", "apple", "oracle", "meta", "tesla", "tcs", "infosys",
+        "wipro", "reliance", "tata", "intel", "samsung", "sony", "ibm", "baidu", "alibaba",
+        "tencent", "nvidia", "adobe", "salesforce", "cisco", "netflix", "spotify", "uber",
+        "airbnb", "walmart", "boeing", "pfizer", "moderna", "novartis", "astrazeneca",
+        "siemens", "toyota", "honda", "volkswagen", "bmw", "mercedes", "barclays", "hsbc",
+        "citigroup", "jpmorgan", "morgan stanley", "goldman sachs"
+    )
 
 
 settings = Settings()

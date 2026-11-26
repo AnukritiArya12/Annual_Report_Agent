@@ -1,86 +1,174 @@
-"""Run this FIRST:  python check_setup.py
-Tells you which files are missing/outdated and which packages are not installed."""
+"""DeepAgent Setup & Architecture Verification Script.
+
+Usage:
+    python check_setup.py
+
+Validates the ONE autonomous DeepAgent architecture, required packages,
+standard Agent Skills, tools layer, and environment configuration.
+"""
+
+from __future__ import annotations
+
 import importlib.util
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# file -> text that only the NEW version contains (detects old files left over from the first version)
-FILES = {
-    "main.py": "class MainOrchestrator", "planner.py": "_split_node", "agent.py": "class RunContext",
-    "knowledge.py": "class ReferenceIngestor", "validator.py": "_foreign_entities", "assembler.py": "parse_markdown_blocks",
-    "config.py": "class AnthropicClient", "schemas.py": "class SourceDocument", "tools.py": "def download_pdf",
-    "skills.py": "STYLE_GUIDES", "approvals.py": "class ApprovalAborted", "utils.py": "def foreign_entities",
-    # Phase 1-4 additions
-    "jurisdictions.py": "JURISDICTION_REGISTRY",
-    "ledger.py": "class FactsLedger",
-    "statements.py": "class FinancialStatementBuilder",
+CORE_FILES = {
+    "agent.py": "create_deep_agent",
+    "app.py": "build_annual_report_agent",
+    "approvals.py": "class ApprovalAborted",
+    "assembler.py": "class ReportAssembler",
     "charts.py": "class ChartGenerator",
+    "config.py": "class Settings",
+    "financial.py": "class FinancialVerifier",
+    "jurisdictions.py": "JURISDICTION_REGISTRY",
+    "knowledge.py": "def parse_pdf",
+    "ledger.py": "class FactsLedger",
+    "statements.py": "extract_structured_statements",
+    "storage.py": "class DatabaseStorageEngine",
+    "utils.py": "def sanitize_untrusted",
+    "validator.py": "class DynamicValidator",
 }
 
-PACKAGES = [("requests", "requests"), ("bs4", "beautifulsoup4"), ("ddgs", "ddgs"), ("pydantic", "pydantic"),
-            ("dotenv", "python-dotenv"), ("docx", "python-docx"), ("reportlab", "reportlab"),
-            ("pytesseract", "pytesseract"), ("PIL", "pillow"), ("lxml", "lxml"), ("rank_bm25", "rank_bm25"),
-            ("matplotlib", "matplotlib")]
+TOOL_FILES = [
+    "tools/__init__.py",
+    "tools/session.py",
+    "tools/discovery_tools.py",
+    "tools/retrieval_tools.py",
+    "tools/financial_tools.py",
+    "tools/validation_tools.py",
+    "tools/output_tools.py",
+    "tools/checkpointer.py",
+    "tools/web.py",
+]
 
-NEW_MODULES = [
-    "connectors/__init__.py", "connectors/base.py", "connectors/registry.py",
-    "connectors/sec_edgar.py", "connectors/india.py", "connectors/uk_companies_house.py",
-    "connectors/investor_relations.py",
-    "eval/eval_config.json", "eval/run_eval.py",
+SKILL_DIRS = [
+    "source-discovery",
+    "cold-start-company",
+    "report-planning",
+    "section-writing",
+    "financial-reporting",
+    "validation-and-revision",
+    "human-approval",
+]
+
+PACKAGES = [
+    ("deepagents", "deepagents"),
+    ("langchain", "langchain"),
+    ("langgraph", "langgraph"),
+    ("requests", "requests"),
+    ("bs4", "beautifulsoup4"),
+    ("ddgs", "ddgs"),
+    ("pydantic", "pydantic"),
+    ("dotenv", "python-dotenv"),
+    ("docx", "python-docx"),
+    ("reportlab", "reportlab"),
+    ("chromadb", "chromadb"),
+    ("PIL", "pillow"),
+    ("rank_bm25", "rank_bm25"),
+    ("matplotlib", "matplotlib"),
 ]
 
 ok = True
-print(f"Folder: {HERE}\n\nFILES")
-for name, marker in FILES.items():
+print(f"Project Root: {HERE}\n")
+
+# 1. Autonomous DeepAgent Core Files
+print("CORE ARCHITECTURE FILES")
+for name, marker in CORE_FILES.items():
     path = os.path.join(HERE, name)
     if not os.path.exists(path):
-        print(f"  MISSING   {name}"); ok = False; continue
+        print(f"  MISSING   {name}")
+        ok = False
+        continue
     text = open(path, encoding="utf-8", errors="ignore").read()
     if marker not in text:
-        print(f"  OUTDATED  {name}  (old version - replace it with the new one)"); ok = False
+        print(f"  OUTDATED  {name} (expected marker '{marker}')")
+        ok = False
     else:
         print(f"  ok        {name}")
 
-print("\nNEW MODULES (Phase 1-4)")
-for rel in NEW_MODULES:
+# 2. Tools Package
+print("\nTOOLS PACKAGE")
+for rel in TOOL_FILES:
     path = os.path.join(HERE, rel)
     if os.path.exists(path):
         print(f"  ok        {rel}")
     else:
-        print(f"  MISSING   {rel}"); ok = False
+        print(f"  MISSING   {rel}")
+        ok = False
 
-print("\nPACKAGES")
+# 3. Agent Skills Standard
+print("\nAGENT SKILLS STANDARD (skills/<skill>/SKILL.md)")
+for s_dir in SKILL_DIRS:
+    path = os.path.join(HERE, "skills", s_dir, "SKILL.md")
+    if os.path.exists(path):
+        txt = open(path, encoding="utf-8", errors="ignore").read()
+        if "---" in txt and "name:" in txt and "description:" in txt:
+            print(f"  ok        skills/{s_dir}/SKILL.md")
+        else:
+            print(f"  INVALID   skills/{s_dir}/SKILL.md (missing YAML frontmatter)")
+            ok = False
+    else:
+        print(f"  MISSING   skills/{s_dir}/SKILL.md")
+        ok = False
+
+# 4. Connectors
+print("\nJURISDICTION CONNECTORS")
+connector_files = [
+    "connectors/__init__.py",
+    "connectors/base.py",
+    "connectors/registry.py",
+    "connectors/sec_edgar.py",
+    "connectors/india.py",
+    "connectors/uk_companies_house.py",
+    "connectors/investor_relations.py",
+]
+for rel in connector_files:
+    path = os.path.join(HERE, rel)
+    if os.path.exists(path):
+        print(f"  ok        {rel}")
+    else:
+        print(f"  MISSING   {rel}")
+        ok = False
+
+# 5. Installed Packages
+print("\nPACKAGES & RUNTIME DEPENDENCIES")
 for mod, pip_name in PACKAGES:
     if importlib.util.find_spec(mod) is None:
-        print(f"  MISSING   {pip_name}"); ok = False
+        print(f"  MISSING   {pip_name}")
+        ok = False
     else:
         print(f"  ok        {pip_name}")
+
 if importlib.util.find_spec("pymupdf") is None and importlib.util.find_spec("fitz") is None:
-    print("  MISSING   pymupdf"); ok = False
+    print("  MISSING   pymupdf")
+    ok = False
 else:
     print("  ok        pymupdf")
 
-print("\nSETTINGS (.env)")
-env = os.path.join(HERE, ".env")
-if not os.path.exists(env):
-    print("  MISSING   .env  (copy .env.example to .env and fill in your provider/key)"); ok = False
+# 6. Environment & Provider Configuration
+print("\nENVIRONMENT CONFIGURATION (.env)")
+env_path = os.path.join(HERE, ".env")
+if not os.path.exists(env_path):
+    print("  WARNING   .env not found. Create .env with provider API keys (GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY).")
 else:
-    txt = open(env, encoding="utf-8", errors="ignore").read().lower()
-    has_key = any(k in txt for k in ("gemini_api_key=a", "openai_api_key=s", "anthropic_api_key=s")) \
-        or "llm_provider=ollama" in txt.replace(" ", "")
-    print("  ok        .env found" if has_key else "  WARNING   .env found but no API key / ollama provider detected")
-
-print("\nEVAL HARNESS")
-eval_cfg = os.path.join(HERE, "eval", "eval_config.json")
-eval_py  = os.path.join(HERE, "eval", "run_eval.py")
-for path, label in ((eval_cfg, "eval/eval_config.json"), (eval_py, "eval/run_eval.py")):
-    if os.path.exists(path):
-        print(f"  ok        {label}")
+    txt = open(env_path, encoding="utf-8", errors="ignore").read().lower()
+    has_key = any(k in txt for k in ("gemini_api_key=", "openai_api_key=", "anthropic_api_key=")) or "llm_provider=ollama" in txt.replace(" ", "")
+    if has_key:
+        print("  ok        .env found with valid provider credentials")
     else:
-        print(f"  MISSING   {label}"); ok = False
+        print("  WARNING   .env found but no active API key or provider configured")
 
-print("\n" + ("ALL GOOD. Run:  python main.py \"Apple\" --fy \"FY 2025\" --country USA --pages 60" if ok else
-      "FIX THE ITEMS ABOVE, then run this check again.\n(packages:  pip install -r requirements.txt)"))
+print("\n" + ("=" * 60))
+if ok:
+    print("ALL CHECKS PASSED. SYSTEM IS READY.")
+    print("To run the autonomous DeepAgent:")
+    print("  python app.py --company \"Apple Inc\" --fy \"FY 2024\" --country \"United States\"")
+else:
+    print("SOME CHECKS FAILED. Please review the missing or outdated items above.")
+    print("To install dependencies: pip install -r requirements.txt")
+print("=" * 60)
+
 sys.exit(0 if ok else 1)

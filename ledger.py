@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from config import get_llm, settings
+from config import settings
 from financial import clean_number
 from storage import DatabaseStorageEngine
 from utils import extract_json
@@ -67,7 +67,7 @@ class FactRecord:
 class FactsLedger:
     """Manages verified canonical metrics extracted from retrieved document chunks."""
 
-    def __init__(self, storage: Optional[DatabaseStorageEngine] = None, db_path: Optional[str] = None):
+    def __init__(self, storage: Optional[DatabaseStorageEngine] = None, db_path: Optional[str] = None, llm: Optional[Any] = None):
         if storage is not None:
             self.storage = storage
             self.db_path = storage.db_path
@@ -76,6 +76,7 @@ class FactsLedger:
             self.db_path = db_path
         else:
             raise ValueError("Must provide either storage or db_path to FactsLedger")
+        self.llm = llm
         self._init_sqlite()
 
     def _init_sqlite(self) -> None:
@@ -128,7 +129,12 @@ class FactsLedger:
     def get_missing_core_keys(self, target_period: str) -> List[str]:
         """List core metrics that have not been found for the target period."""
         all_facts = self.get_all_facts()
-        found_keys = {f.key for f in all_facts if f.numeric_value is not None or f.value.strip()}
+        tp_low = target_period.strip().lower()
+        found_keys = {
+            f.key for f in all_facts
+            if (f.numeric_value is not None or (f.value and f.value.strip()))
+            and (not tp_low or tp_low in f.period.lower() or f.period.lower() in tp_low)
+        }
         return [k for k in CORE_METRIC_KEYS if k not in found_keys]
 
     def record_fact(self, fact: FactRecord) -> None:
@@ -141,20 +147,37 @@ class FactsLedger:
                           fact.period, fact.scope, fact.source_doc_id, fact.page, fact.chunk_id,
                           fact.confidence, fact.status.value))
 
-    def build_ledger(self, company_name: str, financial_year: str, reporting_scope: str = "Consolidated") -> int:
+    def build_ledger(self, company_name: str, financial_year: str, reporting_scope: str = "Consolidated",
+                     force: bool = False) -> int:
         """Extract canonical facts for core metrics from retrieved database chunks.
         
         Rejects any value whose number does not appear in cited chunk text.
         Marks conflicting values for same key+period as CONFLICTING.
         """
-        existing_count = self.count_facts()
-        if existing_count > 0:
-            print(f"  [Facts Ledger] Using {existing_count} existing canonical facts.")
-            return existing_count
+        all_existing = self.get_all_facts()
+        fy_low = financial_year.strip().lower()
+        if not force and any(fy_low in f.period.lower() or f.period.lower() in fy_low for f in all_existing):
+            print(f"  [Facts Ledger] Using existing canonical facts for {financial_year}.")
+            return len(all_existing)
 
         print(f"  [Facts Ledger] Extracting canonical core metrics for {company_name} ({financial_year})...")
-        llm = get_llm()
         added_count = 0
+
+        patterns_map = {
+            "revenue": [r"revenue", r"turnover", r"sales", r"total\s+income"],
+            "operating_profit": [r"operating\s+profit", r"ebit", r"operating\s+income"],
+            "net_profit": [r"net\s+profit", r"net\s+income", r"profit\s+for\s+the\s+(?:period|year)"],
+            "total_assets": [r"total\s+assets"],
+            "total_liabilities": [r"total\s+liabilities"],
+            "shareholders_equity": [r"shareholders\s+equity", r"total\s+equity", r"equity\s+capital", r"initial\s+capital"],
+            "cash_and_equivalents": [r"cash\s+and\s+equivalents", r"cash\s+and\s+bank", r"cash\s+at\s+bank", r"closing\s+cash"],
+            "total_debt": [r"total\s+debt", r"borrowings"],
+            "earnings_per_share": [r"earnings\s+per\s+share", r"eps"],
+            "dividend_per_share": [r"dividend\s+per\s+share", r"dps"],
+            "total_employees": [r"total\s+employees", r"employee\s+count", r"headcount"],
+            "board_directors_count": [r"board\s+directors", r"board\s+members"],
+            "statutory_auditor": [r"statutory\s+auditor", r"independent\s+auditor"],
+        }
 
         # Query storage for each core metric
         for metric_key in CORE_METRIC_KEYS:
@@ -165,7 +188,31 @@ class FactsLedger:
 
             for chunk, sc in hits:
                 chunk_text = chunk.text
-                user_prompt = f"""Extract the metric '{metric_key}' from the following evidence excerpt for {company_name} in {financial_year}.
+                extracted_data = None
+
+                # 1. Fast deterministic regex extraction
+                pats = patterns_map.get(metric_key, [metric_key.replace("_", r"\s+")])
+                for p in pats:
+                    m = re.search(rf"(?:[-*]\s*)?(?:\*\*)?({p})(?:\*\*)?\s*[:|=]\s*([^\n\r]+)", chunk_text, re.IGNORECASE)
+                    if not m:
+                        m = re.search(rf"\|\s*({p})\s*\|\s*([^|\n\r]+)", chunk_text, re.IGNORECASE)
+                    if m:
+                        val_str = m.group(2).strip().strip("*").strip()
+                        extracted_data = {
+                            "found": True,
+                            "metric_name": metric_key,
+                            "raw_string_value": val_str,
+                            "numeric_value": clean_number(val_str),
+                            "unit": "",
+                            "currency": "",
+                            "reporting_period": financial_year,
+                            "confidence": 0.95,
+                        }
+                        break
+
+                # 2. LLM fallback if deterministic regex did not match
+                if not extracted_data and self.llm is not None:
+                    user_prompt = f"""Extract the metric '{metric_key}' from the following evidence excerpt for {company_name} in {financial_year}.
 CRITICAL RULE: The extracted number MUST be literally present in the excerpt. If not found, return {{"found": false}}.
 
 Evidence excerpt (Chunk {chunk.chunk_id}, p.{chunk.page}):
@@ -182,15 +229,22 @@ Return JSON only:
   "reporting_period": "e.g. {financial_year}",
   "confidence": 0.9
 }}"""
-                try:
-                    resp = llm.invoke([
-                        {"role": "system", "content": "You are a corporate financial data auditor. Extract factual metrics strictly matching cited evidence. Return valid JSON only."},
-                        {"role": "user", "content": user_prompt}
-                    ])
-                    data = extract_json(resp.content)
-                    if not isinstance(data, dict) or not data.get("found"):
-                        continue
+                    try:
+                        resp = self.llm.invoke([
+                            {"role": "system", "content": "You are a corporate financial data auditor. Extract factual metrics strictly matching cited evidence. Return valid JSON only."},
+                            {"role": "user", "content": user_prompt}
+                        ])
+                        parsed = extract_json(resp.content)
+                        if isinstance(parsed, dict) and parsed.get("found"):
+                            extracted_data = parsed
+                    except Exception:
+                        pass
 
+                if not extracted_data or not extracted_data.get("found"):
+                    continue
+
+                try:
+                    data = extracted_data
                     raw_val = str(data.get("raw_string_value", "")).strip()
                     num_val = data.get("numeric_value")
                     if num_val is not None:
@@ -200,7 +254,6 @@ Return JSON only:
 
                     # STRICT VALIDATION: If numeric, verify digit sequence appears in chunk text
                     if num_val is not None:
-                        # Extract integer part or main sequence
                         main_digits = re.sub(r"[^\d]", "", str(int(abs(num_val))))
                         chunk_clean = re.sub(r"[^\d]", "", chunk_text)
                         if len(main_digits) >= 2 and main_digits not in chunk_clean:
@@ -212,16 +265,19 @@ Return JSON only:
                     unit_val = str(data.get("unit") or "").strip()
                     conf = float(data.get("confidence") or sc)
 
+                    # Check for duplicate from exact same chunk+period
+                    if any(f.key == metric_key and f.period.lower() == period_val.lower() and f.chunk_id == chunk.chunk_id for f in all_existing):
+                        continue
+
                     # Check for conflicts against existing facts with same key + period
                     status = FactStatus.REPORTED
-                    all_existing = self.get_all_facts()
                     for f in all_existing:
                         if f.key == metric_key and f.period.lower() == period_val.lower():
                             if f.numeric_value is not None and num_val is not None:
                                 diff = abs(f.numeric_value - num_val)
                                 if diff > 0.05 * (abs(f.numeric_value) + 1e-6) and diff > 1.0:
                                     status = FactStatus.CONFLICTING
-                                    # Update existing record status to CONFLICTING
+                                    f.status = FactStatus.CONFLICTING
                                     with sqlite3.connect(self.db_path, timeout=30) as conn:
                                         conn.execute("UPDATE facts SET status = ? WHERE key = ? AND period = ?",
                                                      (FactStatus.CONFLICTING.value, metric_key, period_val))
@@ -241,8 +297,8 @@ Return JSON only:
                         status=status
                     )
                     self.record_fact(rec)
+                    all_existing.append(rec)
                     added_count += 1
-                    break  # Found high-confidence hit for this metric
                 except Exception:
                     continue
 

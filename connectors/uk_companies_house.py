@@ -34,27 +34,40 @@ class CompaniesHouseConnector(SourceConnector):
                 r = requests.get(search_url, headers=hdr, timeout=12)
                 if r.ok:
                     items = r.json().get("items", [])
-                    if items:
-                        co_num = items[0].get("company_number")
-                        co_title = items[0].get("title", company)
+                    target_toks = {t.lower() for t in re.findall(r"[a-zA-Z0-9]+", company)
+                                   if t.lower() not in ("ltd", "limited", "plc", "llp", "co", "uk")}
+                    m_year = re.search(r"\b(20\d\d)\b", fy)
+                    target_year = m_year.group(1) if m_year else ""
+                    matched_item = None
+                    for it in items:
+                        title_toks = {t.lower() for t in re.findall(r"[a-zA-Z0-9]+", it.get("title", ""))}
+                        if target_toks and target_toks.issubset(title_toks):
+                            matched_item = it
+                            break
+                    if matched_item:
+                        co_num = matched_item.get("company_number")
+                        co_title = matched_item.get("title", company)
                         if co_num:
                             # Fetch filing history for accounts
                             filing_url = f"https://api.company-information.service.gov.uk/company/{co_num}/filing-history?category=accounts"
                             rf = requests.get(filing_url, headers=hdr, timeout=12)
                             if rf.ok:
                                 filings = rf.json().get("items", [])
-                                for f in filings[:4]:
+                                for f in filings[:8]:
                                     date_str = f.get("date", "")
                                     desc = f.get("description", "accounts")
+                                    matches_fy = bool(target_year and (target_year in date_str or str(int(target_year) + 1) in date_str))
+                                    conf = 0.92 if matches_fy else 0.72
                                     view_url = f"https://find-and-update.company-information.service.gov.uk/company/{co_num}/filing-history"
                                     candidates.append(CandidateDocument(
                                         url=view_url,
                                         title=f"{co_title} ({co_num}) - {desc.replace('-', ' ').title()} ({date_str})",
                                         period=date_str[:4],
-                                        confidence=0.92,
+                                        confidence=conf,
                                         source_name="UK Companies House API",
                                         raw_data=f
                                     ))
+                                candidates.sort(key=lambda c: -c.confidence)
             except Exception:
                 pass
 
@@ -66,7 +79,7 @@ class CompaniesHouseConnector(SourceConnector):
             m_year = re.search(r"\b(20\d\d)\b", fy)
             target_year = m_year.group(1) if m_year else ""
             query = f'"{company}" accounts OR "annual report" site:find-and-update.company-information.service.gov.uk'
-            hits = self.tools.search(query, max_results=3) if self.tools else []
+            hits = self.tools.web_search(query, max_results=3) if self.tools else []
             for h in hits:
                 candidates.append(CandidateDocument(
                     url=h.get("href", ""),

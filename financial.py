@@ -11,17 +11,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from config import settings
-
-
-class MetricNature(str, Enum):
-    REPORTED = "REPORTED"       # Directly matching numerical evidence excerpt
-    DERIVED = "DERIVED"         # Arithmetically computed from reported figures
-    UNVERIFIED = "UNVERIFIED"   # Figure does not match any evidence item
-    CONFLICTING = "CONFLICTING" # Divergent figures reported across sources
 
 
 @dataclass
@@ -242,6 +234,21 @@ class FinancialVerifier:
             p_val = clean_number(m_np.group(1))
             if r_val is not None and x_val is not None and p_val is not None:
                 ok, msg = FinancialVerifier.reconcile_net_profit(r_val, x_val, p_val)
+                if ok:
+                    res.reconciled_items.append(msg)
+                else:
+                    res.errors.append(msg)
+
+        # Cash Flow Statement: Closing Cash = Opening Cash + Net Change
+        m_open = re.search(r"(?:opening\s+cash|cash\s+at\s+beginning)[^|\n\d]*[|\s:]+([$\u20b9\u20ac\u00a3]?\s*[\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+        m_chg = re.search(r"(?:net\s+(?:increase|decrease|change)\s+in\s+cash)[^|\n\d]*[|\s:]+([$\u20b9\u20ac\u00a3]?\s*[\(\d,]+(?:\.\d+)?\)?)", text, re.IGNORECASE)
+        m_close = re.search(r"(?:closing\s+cash|cash\s+at\s+end)[^|\n\d]*[|\s:]+([$\u20b9\u20ac\u00a3]?\s*[\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+        if m_open and m_chg and m_close:
+            o_val = clean_number(m_open.group(1))
+            c_val = clean_number(m_chg.group(1))
+            cl_val = clean_number(m_close.group(1))
+            if o_val is not None and c_val is not None and cl_val is not None:
+                ok, msg = FinancialVerifier.reconcile_cash_flow(o_val, c_val, cl_val)
                 if ok:
                     res.reconciled_items.append(msg)
                 else:

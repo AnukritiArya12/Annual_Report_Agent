@@ -180,22 +180,11 @@ def _get_spacy_model():
     return _SPACY_NLP
 
 
-# Prominent global enterprise names that often appear without traditional legal suffixes
-_PROMINENT_CORPORATE_NAMES = {
-    "microsoft", "google", "amazon", "apple", "oracle", "meta", "tesla", "tcs", "infosys",
-    "wipro", "reliance", "tata", "intel", "samsung", "sony", "ibm", "baidu", "alibaba",
-    "tencent", "nvidia", "adobe", "salesforce", "cisco", "netflix", "spotify", "uber",
-    "airbnb", "walmart", "boeing", "pfizer", "moderna", "novartis", "astrazeneca",
-    "siemens", "toyota", "honda", "volkswagen", "bmw", "mercedes", "barclays", "hsbc",
-    "citigroup", "jpmorgan", "morgan stanley", "goldman sachs"
-}
-
-
 def find_org_names(text: str, allow_list: Optional[Sequence[str]] = None) -> List[str]:
     """Organisation names in text using a layered check:
     (a) allow-list filtering for confirmed identity components,
     (b) optional spaCy NER (`en_core_web_sm` ORG entities, skipped silently if missing),
-    (c) regex fallback capturing entities with corporate suffixes AND standalone names without suffixes (e.g. Microsoft).
+    (c) regex fallback capturing entities with corporate suffixes, plus any configured EXTRA_ORG_NAMES.
     """
     body = (text or "").split("*Sources:")[0]
     body = re.sub(r",\s+(?=(?:Inc|Corp|Ltd|LLC|LLP|PLC|plc|Limited|Corporation|Co)\b)", " ", body)
@@ -231,15 +220,20 @@ def find_org_names(text: str, allow_list: Optional[Sequence[str]] = None) -> Lis
         seen.add(core)
         out.append(disp)
 
-    # Layer (c): Fallback 2 - Standalone prominent names without corporate suffixes
-    word_tokens = re.findall(r"\b[A-Z][a-zA-Z0-9&'\-.]*\b", body)
-    for w in word_tokens:
-        w_low = w.lower()
-        if w_low in _PROMINENT_CORPORATE_NAMES:
-            core = org_core(w)
-            if core and core not in seen and core not in allow_cores:
-                seen.add(core)
-                out.append(w)
+    # Layer (c): Fallback 2 - Optional configured extra org names (zero hardcoded names)
+    try:
+        from config import settings
+        extra_orgs = {o.lower() for o in getattr(settings, "EXTRA_ORG_NAMES", ())}
+    except Exception:
+        extra_orgs = set()
+    if extra_orgs:
+        word_tokens = re.findall(r"\b[A-Z][a-zA-Z0-9&'\-.]*\b", body)
+        for w in word_tokens:
+            if w.lower() in extra_orgs:
+                core = org_core(w)
+                if core and core not in seen and core not in allow_cores:
+                    seen.add(core)
+                    out.append(w)
 
     return out
 
