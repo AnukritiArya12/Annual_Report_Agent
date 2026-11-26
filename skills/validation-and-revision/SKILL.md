@@ -20,6 +20,7 @@ Subject every drafted section to dual-pass deterministic validation (entity guar
    - `FAIL`: Examine the listed `issues`. Identify whether the failure is caused by (a) repetition, (b) ungrounded numbers, (c) blank table cells, or (d) ledger mismatch.
 4. **Execute Targeted Edits**: Use `edit_file` to fix specific failing paragraphs or tables rather than rewriting the entire section blindly.
 5. **Re-Validate**: Always call `check_section` again after revising until it returns `PASS`.
+6. **Verify Regulatory Coverage**: Before calling `assemble_report`, call `check_regulatory_coverage` to verify all statutory and industry peer requirements are met on disk. Address any missing statutory disclosures.
 
 ## CONSTRAINTS
 - A section with unresolved `FAIL` status must never be included in the final report assembly.

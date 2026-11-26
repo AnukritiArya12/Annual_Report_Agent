@@ -43,6 +43,7 @@ class TestPhase1Tools(unittest.TestCase):
             "verify_financials",
             "check_entities",
             "check_section",
+            "check_regulatory_coverage",
             "make_charts",
             "assemble_report",
             "request_human_decision",

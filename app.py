@@ -46,6 +46,21 @@ def run_agent_cli(
         auto_approve=auto_approve,
     )
 
+    # Validate resume manifest if continuing an existing run
+    if resume:
+        valid_resume, resume_msg = session.validate_resume_manifest()
+        if not valid_resume:
+            print(f"\n[!] Resume verification failed: {resume_msg}")
+            return 1
+        print(f"[*] Verified resume integrity: {resume_msg}")
+    else:
+        session.update_manifest("run_started", {
+            "company": company,
+            "financial_year": fy,
+            "scope": scope,
+            "country": country,
+        })
+
     # 2. If user provided a local PDF or dossier, ingest immediately into storage
     if pdf_path and os.path.exists(pdf_path):
         print(f"[*] Ingesting provided primary document: {pdf_path}")
@@ -120,7 +135,7 @@ def run_agent_cli(
                                 user_choice = "approve"
                                 print("  [--auto-approve] Auto-approving checkpoint.")
                             else:
-                                prompt_text = "\nEnter 'y' to approve, 'n' to reject/modify, or 'abort' to stop: "
+                                prompt_text = "\nEnter 'y' to approve, 'n' to reject, 'm' to modify scope/entity, or 'abort': "
                                 try:
                                     resp = input(prompt_text).strip().lower()
                                 except (EOFError, KeyboardInterrupt):
@@ -129,7 +144,26 @@ def run_agent_cli(
                                 if resp == "abort":
                                     print("[*] Run aborted by user.")
                                     return 1
-                                user_choice = "approve" if resp in ("y", "yes", "") else "reject"
+                                if resp in ("y", "yes", ""):
+                                    user_choice = "approve"
+                                elif resp in ("m", "modify"):
+                                    mod_scope = input("Enter revised reporting scope (or press Enter to keep): ").strip()
+                                    if mod_scope:
+                                        session.reporting_scope = mod_scope
+                                        print(f"  [Configuration Updated] Reporting scope set to '{mod_scope}'.")
+                                    user_choice = "modified"
+                                else:
+                                    user_choice = "reject"
+                                    try:
+                                        rej_target = input("Enter domain or URL to permanently block (or press Enter to skip): ").strip()
+                                    except (EOFError, KeyboardInterrupt):
+                                        rej_target = ""
+                                    if rej_target:
+                                        if rej_target.startswith(("http://", "https://")):
+                                            session.reject_source(rej_target)
+                                        else:
+                                            session.reject_domain(rej_target)
+                                        print(f"  [Security Guard] Added '{rej_target}' to permanent rejection list.")
 
                             # Resume graph execution with the decision
                             from langgraph.types import Command

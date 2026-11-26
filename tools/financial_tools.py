@@ -87,6 +87,13 @@ def build_financial_tools(session: ReportSession) -> List[BaseTool]:
         GUARDRAIL: If numeric, verifies digits appear in the cited chunk (when chunk_id is provided).
         """
         num_val = clean_number(value)
+        # GUARDRAIL: Strict Peer-Data Isolation - never allow peer benchmark data to enter canonical ledger
+        if any(p in (source_doc_id or "").lower() or p in (chunk_id or "").lower() for p in ("peer", "benchmark", "industry_peer")):
+            return json.dumps({
+                "status": "REJECTED",
+                "reason": "Peer benchmark data is strictly structural and cannot be recorded as target company facts.",
+            })
+
         if num_val is not None and chunk_id:
             # Verify digit sequence exists in cited chunk
             hits = session.storage.search(value, k=5)

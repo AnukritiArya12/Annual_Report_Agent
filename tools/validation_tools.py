@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import List, Optional
 from langchain_core.tools import BaseTool, tool
 
 from config import settings
 from financial import FinancialVerifier
+from jurisdictions import get_jurisdiction, get_industry_benchmark
 from tools.session import ReportSession
 from utils import foreign_entities, shingle_set, word_count
 
@@ -138,4 +140,103 @@ def build_validation_tools(session: ReportSession) -> List[BaseTool]:
             "reconciled_items": fin_res.reconciled_items,
         }, indent=2)
 
-    return [check_entities, check_section]
+    @tool
+    def check_regulatory_coverage(sector: str = "") -> str:
+        """Audit drafted chapters against a source-backed matrix of statutory & industry requirements.
+
+        Checks whether all mandatory statutory sections for the jurisdiction and standard
+        peer chapters for the industry sector are covered on disk. Flags missing or uncertain items.
+        """
+        import glob
+        juri = get_jurisdiction(session.country)
+        sec_bm = get_industry_benchmark(sector)
+
+        drafts_dir = os.path.join(session.run_dir, "drafts")
+        draft_files = glob.glob(os.path.join(drafts_dir, "*.md")) if os.path.exists(drafts_dir) else []
+
+        drafts_text: Dict[str, str] = {}
+        for df in draft_files:
+            try:
+                with open(df, "r", encoding="utf-8", errors="replace") as f:
+                    drafts_text[os.path.basename(df)] = f.read()
+            except Exception:
+                pass
+
+        # Also consider sections registered in session
+        for s_name, s_txt in session.completed_sections.items():
+            if s_name not in drafts_text:
+                drafts_text[s_name] = s_txt
+
+        combined_text = "\n\n".join(drafts_text.values()).lower()
+
+        met_sections: List[Dict[str, Any]] = []
+        missing_sections: List[Dict[str, Any]] = []
+        uncertain_sections: List[Dict[str, Any]] = []
+
+        # 1. Statutory mandatory sections check
+        for m in juri.mandatory_sections:
+            title_clean = m.title.lower()
+            toks = [t for t in re.findall(r"[a-z0-9]+", title_clean) if len(t) >= 4]
+            matched_file = None
+            for fname, ftxt in drafts_text.items():
+                if any(t in fname.lower() or t in ftxt[:500].lower() for t in toks):
+                    matched_file = fname
+                    break
+
+            if matched_file:
+                wc = word_count(drafts_text[matched_file])
+                if wc >= 100:
+                    met_sections.append({"requirement": m.title, "type": "Statutory Mandate", "file": matched_file, "word_count": wc})
+                else:
+                    uncertain_sections.append({
+                        "requirement": m.title,
+                        "type": "Statutory Mandate",
+                        "file": matched_file,
+                        "issue": f"Drafted section is thin ({wc} words < 100 words requirement).",
+                    })
+            else:
+                missing_sections.append({"requirement": m.title, "type": "Statutory Mandate", "purpose": m.purpose, "kind": m.kind})
+
+        # 2. Industry sector benchmark chapters check
+        for ch in sec_bm.recommended_chapters:
+            ch_clean = ch.lower()
+            toks = [t for t in re.findall(r"[a-z0-9]+", ch_clean) if len(t) >= 4]
+            matched_file = None
+            for fname, ftxt in drafts_text.items():
+                if any(t in fname.lower() or t in ftxt[:500].lower() for t in toks):
+                    matched_file = fname
+                    break
+
+            if matched_file:
+                wc = word_count(drafts_text[matched_file])
+                if wc >= 80:
+                    met_sections.append({"requirement": ch, "type": "Industry Benchmark", "file": matched_file, "word_count": wc})
+                else:
+                    uncertain_sections.append({
+                        "requirement": ch,
+                        "type": "Industry Benchmark",
+                        "file": matched_file,
+                        "issue": f"Coverage is brief ({wc} words).",
+                    })
+            else:
+                missing_sections.append({"requirement": ch, "type": "Industry Benchmark", "purpose": "Sector peer disclosure standard", "kind": "narrative"})
+
+        total_req = len(juri.mandatory_sections) + len(sec_bm.recommended_chapters)
+        cov_score = round(len(met_sections) / max(1, total_req), 2)
+        ready = (cov_score >= 0.40) and not any(m["type"] == "Statutory Mandate" for m in missing_sections)
+
+        return json.dumps({
+            "jurisdiction": f"{juri.country_name} ({juri.regime_name})",
+            "statute": juri.governing_statute,
+            "industry_sector": sec_bm.sector_name,
+            "coverage_score": cov_score,
+            "is_ready_for_assembly": ready,
+            "met_requirements_count": len(met_sections),
+            "missing_count": len(missing_sections),
+            "uncertain_count": len(uncertain_sections),
+            "met_sample": met_sections[:8],
+            "missing_sections": missing_sections[:8],
+            "uncertain_sections": uncertain_sections,
+        }, indent=2)
+
+    return [check_entities, check_section, check_regulatory_coverage]

@@ -116,6 +116,12 @@ def build_output_tools(session: ReportSession) -> List[BaseTool]:
         except Exception as e:
             out_files["pdf_error"] = str(e)
 
+        session.update_manifest("report_assembled", {
+            "status": "COMPLETED",
+            "sections_included": len(sections_body),
+            "files": out_files,
+        })
+
         return json.dumps({
             "status": "ASSEMBLED",
             "sections_included": len(sections_body),
@@ -128,24 +134,32 @@ def build_output_tools(session: ReportSession) -> List[BaseTool]:
         question: str,
         options: Optional[List[str]] = None,
         approve_domain: str = "",
+        reject_domain: str = "",
+        reject_source: str = "",
         approve_names: Optional[List[str]] = None,
         exclude_names: Optional[List[str]] = None,
+        modified_scope: str = "",
     ) -> str:
         """Ask the human for approval on a risky decision (identity, source domain, outline, flagged section, or publish).
 
-        Persists the answer in session state so on resume the same decision is never asked again.
+        Persists approvals, rejections, and scope modifications in session state and run manifest.
         When executed under DeepAgents interrupt_on, execution pauses before this tool runs for human review.
         """
         # If already persisted in session, return cached decision without re-asking
         if decision_key in session.human_decisions:
+            cached = session.human_decisions[decision_key]
             return json.dumps({
                 "decision_key": decision_key,
-                "status": "CACHED_APPROVAL",
-                "decision": session.human_decisions[decision_key],
+                "status": "CACHED_DECISION",
+                "decision": cached,
             }, indent=2)
 
         if approve_domain:
             session.approve_domain(approve_domain)
+        if reject_domain:
+            session.reject_domain(reject_domain)
+        if reject_source:
+            session.reject_source(reject_source)
         if approve_names:
             for n in approve_names:
                 if n and n not in session.approved_names:
@@ -154,19 +168,31 @@ def build_output_tools(session: ReportSession) -> List[BaseTool]:
             for n in exclude_names:
                 if n and n not in session.excluded_names:
                     session.excluded_names.append(n)
+        if modified_scope:
+            session.reporting_scope = modified_scope
 
+        is_approved = not bool(reject_domain or reject_source)
         decision_record = {
-            "approved": True,
+            "approved": is_approved,
             "question": question,
-            "options": options or ["approve", "reject"],
+            "options": options or ["approve", "reject", "modify"],
             "approved_domain": approve_domain,
+            "rejected_domain": reject_domain,
+            "rejected_source": reject_source,
+            "modified_scope": modified_scope,
         }
         session.human_decisions[decision_key] = decision_record
         session.save_decisions()
+        session.update_manifest("human_decision", {
+            "key": decision_key,
+            "approved": is_approved,
+            "approved_domain": approve_domain,
+            "rejected_domain": reject_domain,
+        })
 
         return json.dumps({
             "decision_key": decision_key,
-            "status": "APPROVED",
+            "status": "APPROVED" if is_approved else "REJECTED",
             "decision": decision_record,
         }, indent=2)
 
