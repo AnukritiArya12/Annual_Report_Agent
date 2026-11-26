@@ -8,6 +8,7 @@ and when to ask a human. Output length scales truthfully with available evidence
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -45,13 +46,34 @@ def build_annual_report_agent(
     resolved_model = model
     if resolved_model is None:
         if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
-            resolved_model = os.getenv("LLM_MODEL", "google-genai:gemini-2.5-pro")
+            resolved_model = os.getenv("LLM_MODEL") or os.getenv("GEMINI_MODEL") or "google_genai:gemini-3.8-flash"
         elif os.getenv("OPENAI_API_KEY"):
-            resolved_model = os.getenv("LLM_MODEL", "openai:gpt-4o")
+            resolved_model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "openai:gpt-4o"
         elif os.getenv("ANTHROPIC_API_KEY"):
-            resolved_model = os.getenv("LLM_MODEL", "anthropic:claude-3-7-sonnet")
+            resolved_model = os.getenv("LLM_MODEL") or os.getenv("ANTHROPIC_MODEL") or "anthropic:claude-3-7-sonnet"
         else:
-            resolved_model = "ollama:llama3.1"
+            resolved_model = os.getenv("LLM_MODEL") or os.getenv("OLLAMA_MODEL") or "ollama:llama3.1"
+
+    # Normalize whitespace, case, and provider prefixes
+    if isinstance(resolved_model, str):
+        resolved_model = re.sub(r"\s+", "", resolved_model).lower()
+        if resolved_model.startswith("google-genai:"):
+            resolved_model = "google_genai:" + resolved_model[len("google-genai:"):]
+        elif resolved_model.startswith("gemini-"):
+            resolved_model = "google_genai:" + resolved_model
+
+        # Canonicalize to available Google Gemini API model names
+        if resolved_model.startswith("google_genai:"):
+            model_id = resolved_model.split(":", 1)[1]
+            if model_id in ("gemini-2.0-flash", "gemini-2.5-pro", "gemini-3.5-flash-lite", "gemini-flash-lite-latest"):
+                model_id = "gemini-3.8-flash"
+            resolved_model = f"google_genai:{model_id}"
+
+    # Synchronize Gemini / Google API keys across environment variables
+    if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+        os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+    elif os.getenv("GOOGLE_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = os.environ["GOOGLE_API_KEY"]
 
     # 2. Composite Backend: skills loaded from repository root, workspace bound to run_dir
     repo_root = os.path.abspath(os.path.dirname(__file__))

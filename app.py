@@ -7,6 +7,12 @@ import os
 import sys
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from agent import build_annual_report_agent
 from tools import ReportSession
 from utils import slug
@@ -188,7 +194,8 @@ def run_agent_cli(
 
 def main():
     parser = argparse.ArgumentParser(description="Autonomous Annual Report DeepAgent")
-    parser.add_argument("company", type=str, help="Company name")
+    parser.add_argument("company", type=str, nargs="?", default="", help="Company name (positional)")
+    parser.add_argument("--company", type=str, default="", dest="company_opt", help="Company name (flag)")
     parser.add_argument("--fy", type=str, default="FY 2024", help="Financial Year (e.g. 'FY 2024')")
     parser.add_argument("--country", type=str, default="", help="Country or jurisdiction")
     parser.add_argument("--scope", type=str, default="consolidated", help="Reporting scope")
@@ -200,8 +207,12 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoints")
 
     args = parser.parse_args()
+    target_company = (args.company_opt or args.company or "").strip()
+    if not target_company:
+        parser.error("Company name is required. Specify as 'python app.py \"Apple Inc\"' or 'python app.py --company \"Apple Inc\"'.")
+
     sys.exit(run_agent_cli(
-        company=args.company,
+        company=target_company,
         fy=args.fy,
         country=args.country,
         scope=args.scope,

@@ -96,7 +96,7 @@ python app.py --company "Apple Inc" --fy "FY 2024" --country "United States"
 | `--fy` | Target reporting period / fiscal year | *(Required)* |
 | `--country` | Governing jurisdiction / country | `""` |
 | `--scope` | Reporting scope (`consolidated` or `standalone`) | `consolidated` |
-| `--model` | Model specifier (e.g. `google-genai:gemini-2.5-pro`, `openai:gpt-4o`) | Auto-resolved from `.env` |
+| `--model` | Model specifier (e.g. `google_genai:gemini-3.8-flash`, `openai:gpt-4o`) | Auto-resolved from `.env` |
 | `--auto-approve` | Bypass HITL prompts (intended for automated testing/eval) | `False` |
 | `--resume` | Resume an interrupted run from existing thread checkpointer | `False` |
 | `--pdf` | Generate high-resolution PDF publication | `True` |
