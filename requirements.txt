@@ -11,3 +11,4 @@ pytesseract
 pillow
 lxml
 rank_bm25
+matplotlib

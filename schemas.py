@@ -100,6 +100,9 @@ class ReportBlueprint(BaseModel):
     company_profile: CompanyProfile
     reference_documents: List[SourceDocument] = Field(default_factory=list)
     target_pages: int = 0
+    planned_pages: int = 0
+    evidence_supported_pages: int = 0
+    evidence_capacity_note: str = ""
     chapters: List[ChapterBlueprint] = Field(default_factory=list)
     tasks: List[TaskDefinition] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_now)

@@ -2,7 +2,7 @@
 
 import json
 import re
-from typing import Any, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 def clean_llm_text(text: str) -> str:
@@ -13,6 +13,64 @@ def clean_llm_text(text: str) -> str:
     text = text.strip()
     m = re.match(r"^```(?:markdown|md|json)?\s*\n(.*?)\n```$", text, flags=re.DOTALL)
     return (m.group(1) if m else text).strip()
+
+
+_INJECTION_LINE_PATTERNS = [
+    re.compile(r"^\s*(?:system|user|assistant|human|ai)\s*:\s*", re.IGNORECASE),
+    re.compile(r"(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|prompts|rules|commands)", re.IGNORECASE),
+    re.compile(r"(?:you\s+are\s+now|act\s+as|pretend\s+to\s+be)\s+(?:a|an|the|my)?\s*", re.IGNORECASE),
+    re.compile(r"<\s*\|(?:im_start|im_end|endoftext)\|\s*>", re.IGNORECASE),
+    re.compile(r"\[\s*/?(?:inst|system|prompt)\s*\]", re.IGNORECASE),
+    re.compile(r"<\s*/?(?:system|prompt|instruction)\s*>", re.IGNORECASE),
+    re.compile(r"^\s*(?:override|bypass)\s+(?:all\s+)?(?:safety|system|guardrail)\s+(?:rules|instructions)", re.IGNORECASE),
+    re.compile(r"^\s*(?:new|updated|secret)\s+(?:instructions|guidelines|directive)\s*:\s*", re.IGNORECASE),
+]
+
+_HIDDEN_HTML_PATTERNS = [
+    re.compile(r"<[^>]+style\s*=\s*['\"][^'\"]*display\s*:\s*none[^'\"]*['\"][^>]*>.*?<\s*/\s*[^>]+>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<[^>]+style\s*=\s*['\"][^'\"]*visibility\s*:\s*hidden[^'\"]*['\"][^>]*>.*?<\s*/\s*[^>]+>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<[^>]+style\s*=\s*['\"][^'\"]*font-size\s*:\s*0(?:px)?['\"][^>]*>.*?<\s*/\s*[^>]+>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<!--.*?-->", re.DOTALL),
+]
+
+
+def sanitize_untrusted(text: str, log_removals: bool = True) -> str:
+    """Neutralize and strip prompt injection attempts and hidden text from untrusted inputs.
+    
+    Removes instruction overrides, role markers, and hidden HTML payloads.
+    Logs count of neutralized patterns.
+    """
+    if not text:
+        return ""
+    removed_count = 0
+    cleaned = text
+
+    # 1. Strip hidden HTML injection payloads
+    for pat in _HIDDEN_HTML_PATTERNS:
+        matches = len(pat.findall(cleaned))
+        if matches:
+            removed_count += matches
+            cleaned = pat.sub("", cleaned)
+
+    # 2. Filter instruction-like lines
+    lines = cleaned.splitlines()
+    safe_lines = []
+    for line in lines:
+        is_injection = False
+        for pat in _INJECTION_LINE_PATTERNS:
+            if pat.search(line):
+                is_injection = True
+                removed_count += 1
+                break
+        if not is_injection:
+            safe_lines.append(line)
+        else:
+            safe_lines.append("[UNTRUSTED CONTENT REMOVED]")
+
+    if removed_count > 0 and log_removals:
+        print(f"  [Security] Neutralized {removed_count} prompt-injection / hidden pattern(s) in untrusted text.")
+
+    return "\n".join(safe_lines)
 
 
 def extract_json(text: str) -> Any:
@@ -101,21 +159,88 @@ def org_core(name: str) -> str:
     return " ".join(t for t in toks if t not in _CORP_WORDS)
 
 
-def find_org_names(text: str) -> List[str]:
-    """Organisation-like names in a text (a capitalised name ending in Inc/Ltd/Corp/Group/Bank/...)."""
+_SPACY_NLP = None
+_SPACY_CHECKED = False
+
+
+def _get_spacy_model():
+    """Load spaCy model if available and enabled, skipping silently otherwise."""
+    global _SPACY_NLP, _SPACY_CHECKED
+    if _SPACY_CHECKED:
+        return _SPACY_NLP
+    _SPACY_CHECKED = True
+    try:
+        from config import settings
+        if not getattr(settings, "SPACY_NER_ENABLED", True):
+            return None
+        import spacy
+        _SPACY_NLP = spacy.load("en_core_web_sm")
+    except Exception:
+        _SPACY_NLP = None
+    return _SPACY_NLP
+
+
+# Prominent global enterprise names that often appear without traditional legal suffixes
+_PROMINENT_CORPORATE_NAMES = {
+    "microsoft", "google", "amazon", "apple", "oracle", "meta", "tesla", "tcs", "infosys",
+    "wipro", "reliance", "tata", "intel", "samsung", "sony", "ibm", "baidu", "alibaba",
+    "tencent", "nvidia", "adobe", "salesforce", "cisco", "netflix", "spotify", "uber",
+    "airbnb", "walmart", "boeing", "pfizer", "moderna", "novartis", "astrazeneca",
+    "siemens", "toyota", "honda", "volkswagen", "bmw", "mercedes", "barclays", "hsbc",
+    "citigroup", "jpmorgan", "morgan stanley", "goldman sachs"
+}
+
+
+def find_org_names(text: str, allow_list: Optional[Sequence[str]] = None) -> List[str]:
+    """Organisation names in text using a layered check:
+    (a) allow-list filtering for confirmed identity components,
+    (b) optional spaCy NER (`en_core_web_sm` ORG entities, skipped silently if missing),
+    (c) regex fallback capturing entities with corporate suffixes AND standalone names without suffixes (e.g. Microsoft).
+    """
     body = (text or "").split("*Sources:")[0]
-    body = re.sub(r",\s+(?=(?:Inc|Corp|Ltd|LLC|LLP|PLC|plc|Limited|Corporation|Co)\b)", " ", body)   # 'Amazon.com, Inc.'
-    out, seen = [], set()
+    body = re.sub(r",\s+(?=(?:Inc|Corp|Ltd|LLC|LLP|PLC|plc|Limited|Corporation|Co)\b)", " ", body)
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    allow_cores = set(_company_cores(allow_list or []))
+
+    # Layer (b): Optional spaCy NER
+    nlp = _get_spacy_model()
+    if nlp is not None:
+        try:
+            doc = nlp(body[:15000])
+            for ent in doc.ents:
+                if ent.label_ in ("ORG", "COMPANY"):
+                    disp = ent.text.strip()
+                    core = org_core(disp)
+                    if core and core not in seen and core not in allow_cores:
+                        seen.add(core)
+                        out.append(disp)
+        except Exception:
+            pass
+
+    # Layer (c): Fallback 1 - Suffix regex
     for m in _ORG_RE.finditer(body):
         words = m.group(1).split()
         while words and words[0].lower().strip(".") in _LEAD_STOP:
             words.pop(0)
         disp = " ".join(words).strip()
         core = org_core(disp)
-        if not core or core in seen:
+        if not core or core in seen or core in allow_cores:
             continue
         seen.add(core)
         out.append(disp)
+
+    # Layer (c): Fallback 2 - Standalone prominent names without corporate suffixes
+    word_tokens = re.findall(r"\b[A-Z][a-zA-Z0-9&'\-.]*\b", body)
+    for w in word_tokens:
+        w_low = w.lower()
+        if w_low in _PROMINENT_CORPORATE_NAMES:
+            core = org_core(w)
+            if core and core not in seen and core not in allow_cores:
+                seen.add(core)
+                out.append(w)
+
     return out
 
 
@@ -143,11 +268,11 @@ def _blocked(excluded, statuses) -> List[Tuple[str, str, str]]:
 
 
 def foreign_entities(text: str, names, excluded=(), evidence_text: str = "", statuses=None,
-                     check_evidence: bool = True) -> List[Tuple[str, str, str]]:
+                     check_evidence: bool = True, allow_list: Sequence[str] = ()) -> List[Tuple[str, str, str]]:
     """Organisations mentioned in a written section that should not be there.
     Returns [(display name, normalised key, reason)]. A name is OK when
       * the human marked it 'allowed', or
-      * it is the company itself (any approved name), or
+      * it is the company itself (any approved name) or in the allow-list (parent, subsidiaries, auditor, regulators), or
       * it also appears in the evidence the section was written from (auditor, peer, customer, own subsidiary ...).
     A name is flagged when it is excluded/forbidden by the human, or (check_evidence=True) is in none of the above,
     which means the model wrote it from its own memory.  check_evidence=False only applies the human's lists."""
@@ -163,8 +288,8 @@ def foreign_entities(text: str, names, excluded=(), evidence_text: str = "", sta
     if not check_evidence:
         return out
     ev = norm_text(evidence_text) if evidence_text else ""
-    comp = set(_company_cores(names))
-    for disp in find_org_names(body):
+    comp = set(_company_cores(list(names) + list(allow_list or [])))
+    for disp in find_org_names(body, allow_list=list(names) + list(allow_list or [])):
         k = org_core(disp)
         if k in seen or statuses.get(k) == "allowed" or k in comp:
             continue

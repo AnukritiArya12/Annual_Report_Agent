@@ -110,6 +110,17 @@ class Settings:
     VECTOR_TOP_N: int = _int("VECTOR_TOP_N", 25)
     OCR_ENABLED: bool = _bool("OCR_ENABLED", True)
 
+    # --- Financial Reconciliation & Safety Settings --------------------------
+    FINANCIAL_RECONCILIATION_TOLERANCE: float = _float("FINANCIAL_RECONCILIATION_TOLERANCE", 0.05)
+    SPACY_NER_ENABLED: bool = _bool("SPACY_NER_ENABLED", True)
+    PROMPT_INJECTION_DEFENCE: bool = _bool("PROMPT_INJECTION_DEFENCE", True)
+
+    # --- Phase 3 Coverage, Charts & Evidence Budgeting Settings --------------
+    EVIDENCE_WORDS_RATIO: float = _float("EVIDENCE_WORDS_RATIO", 2.5)
+    MIN_EVIDENCE_WORDS_PER_PAGE: int = _int("MIN_EVIDENCE_WORDS_PER_PAGE", 150)
+    COMPANIES_HOUSE_API_KEY: str = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
+    CHARTS_ENABLED: bool = _bool("CHARTS_ENABLED", True)
+
 
 settings = Settings()
 

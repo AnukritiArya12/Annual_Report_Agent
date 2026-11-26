@@ -14,6 +14,7 @@ from config import QuotaExhausted, get_llm, settings
 from financial import FinancialVerifier
 from schemas import TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus
 from skills import REVIEW_GUIDANCE
+from statements import get_statement_for_task
 from utils import extract_json, foreign_entities, shingle_set, word_count
 
 
@@ -23,17 +24,24 @@ class DynamicValidator:
         self._shingles: Dict[str, set] = {}
         self.names: List[str] = []                 # approved names of THE company (set by main via set_company)
         self.excluded: List[str] = []
+        self.allow_list: List[str] = []
         self.entity_flags: Dict[str, list] = {}    # task_id -> [(name, key, reason)] found in the latest draft
         self.ledger: Optional[Any] = None
+        self.structured_statements: Dict[str, str] = {}
 
-    def set_company(self, names: List[str], excluded: List[str] = ()) -> None:
+    def set_company(self, names: List[str], excluded: List[str] = (), allow_list: Sequence[str] = ()) -> None:
         self.names = [n for n in names if n]
         self.excluded = list(excluded)
+        self.allow_list = [a for a in allow_list if a]
         self.entity_flags = {}
 
     def set_ledger(self, ledger: Optional[Any]) -> None:
         """Attach verified FactsLedger for quantitative consistency validation."""
         self.ledger = ledger
+
+    def set_structured_statements(self, statements: Dict[str, str]) -> None:
+        """Attach pre-built deterministic financial statements."""
+        self.structured_statements = statements or {}
 
     # ------------------------------------------------------- other-company content
     def _foreign_entities(self, task: TaskDefinition, text: str, output: TaskOutput) -> List[str]:
@@ -41,7 +49,8 @@ class DynamicValidator:
         if not self.names:
             return []
         evidence = " ".join(e.text for e in output.evidence_used)
-        flags = foreign_entities(text, self.names, self.excluded, evidence, approvals.entity_statuses())
+        flags = foreign_entities(text, self.names, self.excluded, evidence, approvals.entity_statuses(),
+                                allow_list=self.allow_list)
         self.entity_flags[task.task_id] = flags
         if not flags:
             return []
@@ -167,6 +176,11 @@ class DynamicValidator:
         issues += self._duplicates(task, text, completed_texts)
         issues += self._blank_table_cells(text)
         issues += self._ledger_consistency(text)
+
+        # Structured financial statement check
+        if task.kind == "financial_statement":
+            if not get_statement_for_task(task.title, self.structured_statements):
+                issues.append("Structured financial statement data was unavailable; figures were synthesized from unstructured text.")
 
         # Deterministic Financial Verification
         evidence_corpus = " ".join(e.text for e in output.evidence_used)

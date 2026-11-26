@@ -22,6 +22,7 @@ except ImportError:                                    # older package name
 
 from config import settings
 from schemas import EvidenceItem
+from utils import sanitize_untrusted
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -180,6 +181,8 @@ class ResearchTools:
             for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
                 tag.decompose()
             text = re.sub(r"\s+", " ", soup.get_text(separator=" ", strip=True)).strip()
+            if getattr(settings, "PROMPT_INJECTION_DEFENCE", True):
+                text = sanitize_untrusted(text)
             return text[:max_chars]
         except Exception:
             return ""
@@ -197,7 +200,10 @@ class ResearchTools:
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup(["script", "style", "noscript", "ix:header"]):
                 tag.decompose()
-            return re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()[:max_chars]
+            text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
+            if getattr(settings, "PROMPT_INJECTION_DEFENCE", True):
+                text = sanitize_untrusted(text)
+            return text[:max_chars]
         except Exception as e:
             self.last_fetch_error = f"{url}: {str(e)[:150]}"
             return ""

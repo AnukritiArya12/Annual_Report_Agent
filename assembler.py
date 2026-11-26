@@ -51,6 +51,9 @@ def parse_markdown_blocks(md: str) -> List[Tuple]:
         m = re.match(r"^(#{1,6})\s+(.*)$", s)
         if m:
             flush(); blocks.append(("h", len(m.group(1)), m.group(2).strip())); i += 1; continue
+        m_img = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", s)
+        if m_img:
+            flush(); blocks.append(("image", m_img.group(1).strip(), m_img.group(2).strip())); i += 1; continue
         if re.match(r"^(-{3,}|\*{3,}|_{3,})$", s):
             flush(); blocks.append(("hr",)); i += 1; continue
         if s.startswith("|"):
@@ -174,7 +177,7 @@ class ReportAssembler:
 
     # ---------------------------------------------------------------- markdown
     def assemble_markdown(self, blueprint: ReportBlueprint, outputs: Dict[str, TaskOutput], out_file: str,
-                          ledger: Optional[Any] = None) -> str:
+                          ledger: Optional[Any] = None, charts: Optional[List[Any]] = None) -> str:
         p, spec = blueprint.company_profile, blueprint.input_spec
         L: List[str] = []
         L.append(f"# {p.company_name} - Annual Report {spec.financial_year}")
@@ -269,6 +272,24 @@ class ReportAssembler:
                         L.append(f"| {f.key.replace('_', ' ').title()} | {f.value} | {f.period} | {f.scope} | {status_str} | {f.source_doc_id} | {page_str} | {f.chunk_id} |")
             except Exception:
                 pass
+
+        # Embedded Financial & Operational Charts
+        if charts:
+            L.append("\n---\n")
+            L.append("## Financial Visualizations & Operational Trends")
+            for c in charts:
+                chart_title = getattr(c, "title", "Chart")
+                chart_path = getattr(c, "image_path", "")
+                chart_caption = getattr(c, "caption", "")
+                chart_source = getattr(c, "source_line", "")
+                L.append(f"\n### {chart_title}")
+                L.append(f"![{chart_title}]({chart_path})")
+                if chart_caption:
+                    L.append(f"*{chart_caption}*")
+                if chart_source:
+                    L.append(f"*{chart_source}*")
+                L.append("")
+
         os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
         with open(out_file, "w", encoding="utf-8") as f:
             f.write("\n".join(L) + "\n")
@@ -373,6 +394,19 @@ class ReportAssembler:
                     r.italic = True
             elif kind == "table":
                 self._docx_table(doc, b[1], b[2], parse_xml, nsdecls, Inches, Pt, RGBColor, WD_TABLE_ALIGNMENT, add_runs)
+            elif kind == "image":
+                alt, img_path = b[1], b[2]
+                if os.path.exists(img_path):
+                    try:
+                        doc.add_picture(img_path, width=Inches(5.8))
+                        if alt:
+                            cap_p = doc.add_paragraph()
+                            cap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                            r = cap_p.add_run(f"Figure: {alt}")
+                            r.font.size = Pt(8.5)
+                            r.font.italic = True
+                    except Exception:
+                        pass
         os.makedirs(os.path.dirname(os.path.abspath(docx_file)), exist_ok=True)
         doc.save(docx_file)
         print(f"[Assembler] DOCX written: {docx_file}")
@@ -553,6 +587,18 @@ class ReportAssembler:
                 ]))
                 story.append(t)
                 story.append(Spacer(1, 8))
+            elif kind == "image":
+                alt, img_path = b[1], b[2]
+                if os.path.exists(img_path):
+                    try:
+                        from reportlab.platypus import Image as RLImage
+                        story.append(Spacer(1, 8))
+                        story.append(RLImage(img_path, width=avail, height=avail * 0.52))
+                        if alt:
+                            story.append(safe_para(f"<i>Figure: {alt}</i>", S["quote"]))
+                        story.append(Spacer(1, 8))
+                    except Exception:
+                        pass
 
         os.makedirs(os.path.dirname(os.path.abspath(pdf_file)), exist_ok=True)
         target_pdf = pdf_file

@@ -25,10 +25,11 @@ import approvals
 from config import get_llm, settings
 from schemas import ReportInput, SourceDocument
 from jurisdictions import get_jurisdiction
+from connectors import get_connectors_for_jurisdiction, SecEdgarConnector
 from skills import CompanyIntelligenceSkill
 from storage import DatabaseStorageEngine as KnowledgeBase, StorageChunk as Chunk
 from tools import ResearchTools, rows_to_markdown
-from utils import extract_json, slug, tokenize
+from utils import extract_json, sanitize_untrusted, slug, tokenize
 
 
 # ------------------------------------------------------------------------------
@@ -339,16 +340,39 @@ class ReferenceIngestor:
             if d:
                 docs.append(d)
         if not docs:
-            print("  [Ingest] Strategy 1/3: SEC EDGAR filings")
-            docs = self._edgar(spec)
+            juri = get_jurisdiction(spec.country)
+            connectors = get_connectors_for_jurisdiction(juri, tools=self.tools, run_dir=self.dir)
+            print(f"  [Ingest] Querying {len(connectors)} official source connectors for {juri.regime_name}...")
+            for conn in connectors:
+                if docs:
+                    break
+                conn_name = conn.__class__.__name__
+                if isinstance(conn, SecEdgarConnector):
+                    docs = self._edgar(spec)
+                else:
+                    cands = conn.search(spec.company_name, spec.financial_year)
+                    if cands:
+                        top = cands[:settings.MAX_REFERENCE_DOCS * 2]
+                        items = [(f"[Score {int(c.confidence * 10)}] {c.title}\n          {c.url}", c.url) for c in top]
+                        keep = approvals.choose(
+                            "connector_select", f"STEP 2 - VERIFY OFFICIAL FILINGS DISCOVERED VIA {conn_name.upper()}?",
+                            items, default_ids=[c.url for c in top[:settings.MAX_REFERENCE_DOCS]],
+                            intro=[f"Discovered {len(cands)} filing candidate(s) via {conn_name}:"]
+                        )
+                        for c in top:
+                            if c.url in keep and len(docs) < settings.MAX_REFERENCE_DOCS:
+                                d = self._ingest_one(c.url, spec, kind="reference_report", url_ok=True, title_hint=c.title)
+                                if d:
+                                    docs.append(d)
+
         if not docs:
-            print("  [Ingest] Strategy 2/3: official annual-report PDFs (search + investor-relations pages)")
+            print("  [Ingest] Secondary Search: official annual-report PDFs (search + investor-relations pages)")
             docs = self._discover_reports(spec)
         if not docs:
-            print("  [Ingest] Strategy 3/3: broad public web corpus (no annual report could be downloaded)")
+            print("  [Ingest] Secondary Strategy: broad public web corpus (no annual report could be downloaded)")
             docs = self._web_corpus(spec)
         if not docs:
-            print(f"  [Ingest] Strategy 4/4: Cold-Start First-Year Entity Dossier (zero public records online)")
+            print(f"  [Ingest] Cold-Start Fallback: First-Year Entity Dossier (zero public records online)")
             docs = self._first_year_dossier(spec)
         docs.sort(key=lambda d: (not bool(d.matches_requested_period), -d.pages))
         if docs:
@@ -686,6 +710,8 @@ class ReferenceIngestor:
                 break
             if len(text.split()) < 150:
                 continue
+            if getattr(settings, "PROMPT_INJECTION_DEFENCE", True):
+                text = sanitize_untrusted(text)
             self.kb.add_document("web_corpus", title[:90], u, _html_to_pages(text, 400))
             used.append(u)
         if not used and not wiki_text:

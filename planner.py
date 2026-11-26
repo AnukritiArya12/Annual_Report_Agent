@@ -19,9 +19,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import sqlite3
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import approvals
 from config import QuotaExhausted, get_llm, settings
@@ -431,6 +432,24 @@ Return JSON: {{"subsections": [ {NODE_SHAPE} ]}}"""
                 ]
         return node
 
+    def estimate_evidence_capacity(self) -> Tuple[int, int, int]:
+        """Estimate (total_unique_words, table_count, evidence_supported_pages) from the knowledge base."""
+        if not self.kb or not hasattr(self.kb, "db_path") or not os.path.exists(self.kb.db_path):
+            return 0, 0, settings.MIN_PAGES
+        try:
+            with sqlite3.connect(self.kb.db_path, timeout=30) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT text, is_table FROM chunks")
+                rows = cur.fetchall()
+            total_words = sum(len(r[0].split()) for r in rows)
+            table_count = sum(1 for r in rows if r[1])
+            words_ratio = getattr(settings, "EVIDENCE_WORDS_RATIO", 2.5)
+            supported_words = int(total_words * words_ratio)
+            supported_pages = max(1, supported_words // settings.WORDS_PER_PAGE)
+            return total_words, table_count, supported_pages
+        except Exception:
+            return 0, 0, settings.MIN_PAGES
+
     # ------------------------------------------------------------ 5. blueprint
     def generate_blueprint(self, spec: ReportInput, profile: CompanyProfile, docs: List[SourceDocument],
                            reference_toc: str) -> ReportBlueprint:
@@ -454,6 +473,22 @@ Return JSON: {{"subsections": [ {NODE_SHAPE} ]}}"""
                 total_pages = 0
             total_pages = total_pages or int(sum(float(c.get("est_pages") or 0) for c in chapters)) or 120
         total_pages = max(settings.MIN_PAGES, min(settings.MAX_PAGES, total_pages))
+
+        # ---- evidence capacity calibration
+        initial_planned_pages = total_pages
+        ev_words, ev_tables, supported_pages = self.estimate_evidence_capacity()
+        capacity_note = ""
+        if ev_words > 0:
+            if total_pages > supported_pages:
+                capacity_note = (
+                    f"Evidence capacity: Knowledge base contains {ev_words:,} words across {ev_tables} tables. "
+                    f"At EVIDENCE_WORDS_RATIO={getattr(settings, 'EVIDENCE_WORDS_RATIO', 2.5)}, evidence truthfully supports ~{supported_pages} pages. "
+                    f"Target length downscaled from {total_pages} to {supported_pages} pages to prevent ungrounded filler."
+                )
+                print(f"[Planner] {capacity_note}")
+                total_pages = supported_pages
+            else:
+                capacity_note = f"Evidence capacity ({ev_words:,} words) adequately supports planned {total_pages} pages."
 
         raw = []
         for c in chapters:
@@ -509,6 +544,9 @@ Return JSON: {{"subsections": [ {NODE_SHAPE} ]}}"""
         report_id = f"{slug(profile.company_name)}_{slug(spec.financial_year)}"
         bp = ReportBlueprint(report_id=report_id, input_spec=spec, company_profile=profile,
                              reference_documents=docs, target_pages=total_pages,
+                             planned_pages=initial_planned_pages,
+                             evidence_supported_pages=supported_pages,
+                             evidence_capacity_note=capacity_note,
                              chapters=chapter_bps, tasks=tasks)
         stages = bp.compute_execution_stages()
         est_words = sum(t.target_words for t in tasks)

@@ -26,12 +26,14 @@ from typing import Dict, List, Tuple
 import approvals
 from agent import GenericTaskExecutionAgent, RunContext
 from assembler import ReportAssembler
+from charts import generate_all_report_charts
 from config import QuotaExhausted, active_model_label, get_llm, settings
 from knowledge import KnowledgeBase, ReferenceIngestor
 from ledger import FactsLedger
 from storage import DatabaseStorageEngine
 from planner import DynamicPlanningEngine
 from schemas import (ExecutionState, ReportInput, TaskDefinition, TaskOutput, TaskStatus, ValidationResult, ValidationStatus)
+from statements import extract_structured_statements
 from tools import ResearchTools
 from utils import SPARSE_MARK, foreign_entities, slug, word_count
 from validator import DynamicValidator
@@ -109,10 +111,14 @@ class MainOrchestrator:
             return ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
 
         # ---- HUMAN CHECKPOINT 6: approve the outline before the (expensive) writing starts
+        plan_details = [
+            f"{len(blueprint.chapters)} chapters, {len(blueprint.tasks)} sections (full list printed above, also in outline.txt)"
+        ]
+        if getattr(blueprint, "evidence_capacity_note", ""):
+            plan_details.append(f"Evidence capacity: {blueprint.evidence_capacity_note}")
+        plan_details.append("Say 'n' to stop; then edit blueprint.json if you want and run again with --resume.")
         if not approvals.confirm("plan", "STEP 2b - APPROVE THE REPORT OUTLINE BEFORE WRITING",
-                                 [f"{len(blueprint.chapters)} chapters, {len(blueprint.tasks)} sections (full list printed above, "
-                                  "also in outline.txt)",
-                                  "Say 'n' to stop; then edit blueprint.json if you want and run again with --resume."],
+                                 plan_details,
                                  default=True, remember_no=False):
             print("\nStopped before writing. Edit blueprint.json if needed, then run again with --resume.")
             return ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
@@ -140,12 +146,21 @@ class MainOrchestrator:
               f"If your provider has a small daily quota, restart with --low-quota.")
         print(f"\n>>> STEP 3: WRITING {len(blueprint.tasks)} SECTIONS "
               f"({len(stages)} stages, {settings.MAX_PARALLEL_WORKERS} parallel workers)")
+        structured_statements = extract_structured_statements(kb)
         self.ctx = RunContext(blueprint=blueprint, kb=kb, tools=self.tools,
-                              draft_dir=os.path.join(self.run_dir, "drafts"), ledger=ledger)
+                              draft_dir=os.path.join(self.run_dir, "drafts"), ledger=ledger,
+                              structured_statements=structured_statements)
         self.validator = DynamicValidator()
         self.validator.set_ledger(ledger)
+        self.validator.set_structured_statements(structured_statements)
         _names, _excluded = approvals.identity()
-        self.validator.set_company(_names or [blueprint.company_profile.company_name], _excluded)
+        _allow = list(_names or [blueprint.company_profile.company_name])
+        if blueprint.company_profile.applicable_regulations:
+            _allow.extend(blueprint.company_profile.applicable_regulations)
+        auditor_facts = [f.value for f in ledger.get_all_facts() if f.key == "statutory_auditor"]
+        if auditor_facts:
+            _allow.extend(auditor_facts)
+        self.validator.set_company(_names or [blueprint.company_profile.company_name], _excluded, allow_list=_allow)
         state = ExecutionState(report_id=blueprint.report_id, blueprint=blueprint)
         done = 0
         total = len(blueprint.tasks)
@@ -212,7 +227,11 @@ class MainOrchestrator:
         docx_file = os.path.join(self.run_dir, f"{rid}.docx")
         pdf_file = os.path.join(self.run_dir, f"{rid}.pdf")
         title = f"{blueprint.company_profile.company_name} - Annual Report {spec.financial_year}"
-        assembler.assemble_markdown(blueprint, state.task_outputs, md_file, ledger=ledger)
+        charts_dir = os.path.join(self.run_dir, "charts")
+        charts = generate_all_report_charts(ledger, kb, charts_dir) if getattr(settings, "CHARTS_ENABLED", True) else []
+        if charts:
+            print(f"  [Charts] Generated {len(charts)} visual charts for report.")
+        assembler.assemble_markdown(blueprint, state.task_outputs, md_file, ledger=ledger, charts=charts)
         for name, fn, path in (("DOCX", assembler.export_docx, docx_file), ("PDF", assembler.export_pdf, pdf_file)):
             try:
                 fn(md_file, path, title)
@@ -221,7 +240,12 @@ class MainOrchestrator:
         state.final_report_path = pdf_file if os.path.exists(pdf_file) else md_file
         summary = {
             "company": blueprint.company_profile.company_name, "financial_year": spec.financial_year,
-            "target_pages": blueprint.target_pages, "chapters": len(blueprint.chapters), "tasks": total,
+            "target_pages": blueprint.target_pages,
+            "planned_pages": getattr(blueprint, "planned_pages", blueprint.target_pages),
+            "evidence_supported_pages": getattr(blueprint, "evidence_supported_pages", blueprint.target_pages),
+            "evidence_capacity_note": getattr(blueprint, "evidence_capacity_note", ""),
+            "charts_generated": len(charts),
+            "chapters": len(blueprint.chapters), "tasks": total,
             "words_written": words, "approx_pages": round(words / settings.WORDS_PER_PAGE),
             "failed_sections": failed, "sections_without_source_material": sparse_secs, "sections_with_open_validation_notes": flagged,
             "reference_documents": [d.title for d in blueprint.reference_documents],
@@ -304,6 +328,24 @@ class MainOrchestrator:
                     *[f"  - {t}" for t in sparse_critical[:6]],
                     "These sections will be published with explicit 'Not Disclosed in Sources Reviewed' disclaimers.",
                     "Approve proceeding to publication, or provide relevant internal records via --pdf?"
+                ],
+                default=True
+            )
+
+        # 4. Financial Statements Missing Structured Data
+        missing_structured = [
+            tasks[tid].title for tid, val in state.validation_results.items()
+            if tasks[tid].kind == "financial_statement" and any("Structured financial statement data was unavailable" in i for i in val.issues_found)
+        ]
+        if missing_structured and not approvals.is_auto():
+            approvals.confirm(
+                "risk_unstructured_financials",
+                "RISK CHECKPOINT - UNSTRUCTURED FINANCIAL STATEMENTS REVIEW",
+                [
+                    f"The following financial statement sections had no structured filing data ({len(missing_structured)}):",
+                    *[f"  - {t}" for t in missing_structured[:6]],
+                    "Figures were drafted from unstructured narrative excerpts rather than official tables.",
+                    "Approve proceeding with draft financial statements?"
                 ],
                 default=True
             )

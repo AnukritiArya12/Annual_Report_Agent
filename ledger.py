@@ -67,9 +67,15 @@ class FactRecord:
 class FactsLedger:
     """Manages verified canonical metrics extracted from retrieved document chunks."""
 
-    def __init__(self, storage: DatabaseStorageEngine):
-        self.storage = storage
-        self.db_path = storage.db_path
+    def __init__(self, storage: Optional[DatabaseStorageEngine] = None, db_path: Optional[str] = None):
+        if storage is not None:
+            self.storage = storage
+            self.db_path = storage.db_path
+        elif db_path is not None:
+            self.storage = None
+            self.db_path = db_path
+        else:
+            raise ValueError("Must provide either storage or db_path to FactsLedger")
         self._init_sqlite()
 
     def _init_sqlite(self) -> None:
