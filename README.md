@@ -70,14 +70,15 @@ python check_setup.py
 ### 4. Configure Environment
 Create a `.env` file in the root directory:
 ```env
-# Choose provider: gemini | openai | anthropic | ollama
-LLM_PROVIDER=gemini
-GEMINI_API_KEY=your_gemini_api_key_here
+# Choose provider: ollama | gemini
+LLM_PROVIDER=ollama
 
-# Optional: Set model override
-# GEMINI_MODEL=gemini-2.5-pro
-# OPENAI_API_KEY=your_openai_api_key_here
-# ANTHROPIC_API_KEY=your_anthropic_api_key_here
+# Ollama (local): make sure this model is installed with `ollama pull gpt-oss:20b`
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=gpt-oss:20b
+
+# For Gemini instead, set LLM_PROVIDER=gemini and GEMINI_API_KEY=your_key
+# GEMINI_MODEL=gemini-3.8-flash
 ```
 
 ---
@@ -96,7 +97,7 @@ python app.py --company "Apple Inc" --fy "FY 2024" --country "United States"
 | `--fy` | Target reporting period / fiscal year | *(Required)* |
 | `--country` | Governing jurisdiction / country | `""` |
 | `--scope` | Reporting scope (`consolidated` or `standalone`) | `consolidated` |
-| `--model` | Model specifier (e.g. `google_genai:gemini-3.8-flash`, `openai:gpt-4o`) | Auto-resolved from `.env` |
+| `--model` | Model specifier (e.g. `ollama:gpt-oss:20b`, `google_genai:gemini-3.5-flash-lite`) | Auto-resolved from `.env` |
 | `--auto-approve` | Bypass HITL prompts (intended for automated testing/eval) | `False` |
 | `--resume` | Resume an interrupted run from existing thread checkpointer | `False` |
 | `--pdf` | Generate high-resolution PDF publication | `True` |

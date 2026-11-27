@@ -1,4 +1,4 @@
-"""Configuration and LLM provider clients (Ollama, Gemini, OpenAI, Anthropic).
+"""Configuration and LLM provider clients (Ollama and Gemini).
 
 All clients expose the same method:  client.invoke([{"role": "...", "content": "..."}]) -> obj.content
 They retry on rate limits / timeouts and RAISE on real failures. There is no silent fallback:
@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)
 except ImportError:
     pass
 
@@ -36,12 +36,10 @@ def _bool(name: str, default: bool) -> bool:
 
 def _resolve_provider() -> str:
     explicit = (os.getenv("LLM_PROVIDER") or "").strip().lower()
-    if explicit:
-        return "gemini" if explicit == "google" else explicit
-    if (os.getenv("OPENAI_API_KEY") or "").strip():
-        return "openai"
-    if (os.getenv("ANTHROPIC_API_KEY") or "").strip():
-        return "anthropic"
+    if "gemini" in explicit or "google" in explicit:
+        return "gemini"
+    if "ollama" in explicit or "local" in explicit or "llama" in explicit:
+        return "ollama"
     if (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip():
         return "gemini"
     return "ollama"
@@ -58,11 +56,7 @@ class Settings:
     OLLAMA_THINK: str = os.getenv("OLLAMA_THINK", "").strip().lower()   # gpt-oss: low | medium | high (low = much faster)
     OLLAMA_NUM_CTX: int = _int("OLLAMA_NUM_CTX", 16384)   # Ollama's default (2-4k) silently truncates prompts
     GEMINI_API_KEY: str = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "").strip()
-    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5").strip()
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
     DEFAULT_TEMPERATURE: float = _float("DEFAULT_TEMPERATURE", 0.2)
     MAX_OUTPUT_TOKENS: int = _int("MAX_OUTPUT_TOKENS", 16384)
@@ -334,56 +328,6 @@ class GeminiClient(_BaseClient):
         raise RuntimeError(f"All Gemini fallback models failed: {last_err}")
 
 
-class OpenAIClient(_BaseClient):
-    provider = "openai"
-
-    def __init__(self, model=None, temperature=None, max_tokens=None, api_key=None):
-        super().__init__(model or settings.OPENAI_MODEL, temperature, max_tokens)
-        self.api_key = api_key or settings.OPENAI_API_KEY
-        if not self.api_key:
-            raise ValueError("OPENAI_API_KEY is missing (set it in .env).")
-
-    def invoke(self, messages, max_tokens=None):
-        system, turns = _split_messages(messages)
-        msgs = ([{"role": "system", "content": system}] if system else []) + turns
-        payload: Dict[str, Any] = {"model": self.model, "messages": msgs,
-                                   "max_completion_tokens": max_tokens or self.max_tokens}
-        if not self.model.lower().startswith(("o1", "o3", "o4", "gpt-5")):
-            payload["temperature"] = self.temperature
-        data = self._post("https://api.openai.com/v1/chat/completions",
-                          headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                          payload=payload)
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"OpenAI returned no choices: {str(data)[:300]}")
-        return LLMResponse(choices[0]["message"].get("content") or "")
-
-
-class AnthropicClient(_BaseClient):
-    provider = "anthropic"
-
-    def __init__(self, model=None, temperature=None, max_tokens=None, api_key=None):
-        super().__init__(model or settings.ANTHROPIC_MODEL, temperature, max_tokens)
-        self.api_key = api_key or settings.ANTHROPIC_API_KEY
-        if not self.api_key:
-            raise ValueError("ANTHROPIC_API_KEY is missing (set it in .env).")
-
-    def invoke(self, messages, max_tokens=None):
-        system, turns = _split_messages(messages)
-        payload: Dict[str, Any] = {"model": self.model, "max_tokens": max_tokens or self.max_tokens,
-                                   "temperature": self.temperature, "messages": turns}
-        if system:
-            payload["system"] = system
-        data = self._post("https://api.anthropic.com/v1/messages",
-                          headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
-                                   "content-type": "application/json"},
-                          payload=payload)
-        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-        if not text.strip():
-            raise RuntimeError(f"Anthropic returned empty text: {str(data)[:300]}")
-        return LLMResponse(text)
-
-
 def get_llm(model: Optional[str] = None, temperature: Optional[float] = None,
             max_tokens: Optional[int] = None):
     prov = settings.LLM_PROVIDER
@@ -391,15 +335,10 @@ def get_llm(model: Optional[str] = None, temperature: Optional[float] = None,
         return GeminiClient(model, temperature, max_tokens)
     if prov == "ollama":
         return OllamaClient(model, temperature, max_tokens)
-    if prov == "openai":
-        return OpenAIClient(model, temperature, max_tokens)
-    if prov == "anthropic":
-        return AnthropicClient(model, temperature, max_tokens)
-    raise ValueError(f"Unsupported LLM_PROVIDER '{prov}'. Use ollama, gemini, openai or anthropic.")
+    raise ValueError(f"Unsupported LLM_PROVIDER '{prov}'. Only 'ollama' and 'gemini' are supported.")
 
 
 def active_model_label() -> str:
     prov = settings.LLM_PROVIDER
-    model = {"ollama": settings.OLLAMA_MODEL, "gemini": settings.GEMINI_MODEL,
-             "openai": settings.OPENAI_MODEL, "anthropic": settings.ANTHROPIC_MODEL}.get(prov, "?")
+    model = {"ollama": settings.OLLAMA_MODEL, "gemini": settings.GEMINI_MODEL}.get(prov, "?")
     return f"{model} ({prov})"

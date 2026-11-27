@@ -151,10 +151,10 @@ else:
 print("\nENVIRONMENT CONFIGURATION (.env)")
 env_path = os.path.join(HERE, ".env")
 if not os.path.exists(env_path):
-    print("  WARNING   .env not found. Create .env with provider API keys (GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY).")
+    print("  WARNING   .env not found. Create .env with GEMINI_API_KEY or LLM_PROVIDER=ollama.")
 else:
     txt = open(env_path, encoding="utf-8", errors="ignore").read().lower()
-    has_key = any(k in txt for k in ("gemini_api_key=", "openai_api_key=", "anthropic_api_key=")) or "llm_provider=ollama" in txt.replace(" ", "")
+    has_key = "gemini_api_key=" in txt or "llm_provider=ollama" in txt.replace(" ", "")
     if has_key:
         print("  ok        .env found with valid provider credentials")
     else:

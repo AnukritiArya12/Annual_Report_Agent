@@ -135,7 +135,7 @@ class SqliteCheckpointSaver(BaseCheckpointSaver):
 
         with sqlite3.connect(self.db_path, timeout=30) as conn:
             cur = conn.cursor()
-            query = "SELECT checkpoint, metadata, parent_checkpoint_id, checkpoint_id FROM checkpoints"
+            query = "SELECT checkpoint, metadata, parent_checkpoint_id, checkpoint_id, type FROM checkpoints"
             params = []
             if thread_id:
                 query += " WHERE thread_id = ? AND checkpoint_ns = ?"
@@ -144,9 +144,9 @@ class SqliteCheckpointSaver(BaseCheckpointSaver):
             if limit:
                 query += f" LIMIT {int(limit)}"
             cur.execute(query, params)
-            for checkpoint_blob, metadata_blob, parent_id, found_id in cur.fetchall():
-                chk = self.serde.loads_typed(("json", checkpoint_blob.decode("utf-8")))
-                meta = self.serde.loads_typed(("json", metadata_blob.decode("utf-8"))) if metadata_blob else {}
+            for checkpoint_blob, metadata_blob, parent_id, found_id, chk_type in cur.fetchall():
+                chk = self.serde.loads_typed((chk_type, checkpoint_blob))
+                meta = self.serde.loads_typed((chk_type, metadata_blob)) if metadata_blob else {}
                 parent_cfg = (
                     {
                         "configurable": {

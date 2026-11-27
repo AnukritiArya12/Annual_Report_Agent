@@ -171,7 +171,7 @@ def _get_spacy_model():
     _SPACY_CHECKED = True
     try:
         from config import settings
-        if not getattr(settings, "SPACY_NER_ENABLED", True):
+        if not getattr(settings, "SPACY_NER_ENABLED", False):
             return None
         import spacy
         _SPACY_NLP = spacy.load("en_core_web_sm")
