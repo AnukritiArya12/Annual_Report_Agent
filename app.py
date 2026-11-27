@@ -204,9 +204,17 @@ def run_agent_cli(
                                             session.reject_domain(rej_target)
                                         print(f"  [Security Guard] Added '{rej_target}' to permanent rejection list.")
 
+                            # Build the decisions payload expected by HumanInTheLoopMiddleware
+                            n_actions = 1
+                            if isinstance(val, dict) and "action_requests" in val:
+                                n_actions = max(len(val.get("action_requests", [])), 1)
+
+                            decision_type = "approve" if user_choice in ("approve", "modified") else "reject"
+                            resume_payload = {"decisions": [{"type": decision_type}] * n_actions}
+
                             # Resume graph execution with the decision
                             from langgraph.types import Command
-                            inputs = Command(resume=user_choice)
+                            inputs = Command(resume=resume_payload)
                             break
                         if interrupted:
                             break
