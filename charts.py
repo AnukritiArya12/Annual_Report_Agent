@@ -8,7 +8,6 @@ Charts are only generated when at least 2 authentic data points exist (zero fabr
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -54,15 +53,15 @@ class ChartGenerator:
         unit = ""
 
         for f in facts:
-            if f.numeric_value is not None and f.period:
+            if (f.numeric_value is not None and f.period
+                    and getattr(f.status, "value", str(f.status)) in {"REPORTED", "DERIVED"}):
+                if f.key in ("revenue", "net_profit", "operating_profit"):
+                    currency = currency or f.currency
+                    unit = unit or f.unit
                 if f.key == "revenue":
                     rev_points[f.period] = f.numeric_value
-                    currency = currency or f.currency
-                    unit = unit or f.unit
                 elif f.key in ("net_profit", "operating_profit"):
                     prof_points[f.period] = f.numeric_value
-                    currency = currency or f.currency
-                    unit = unit or f.unit
 
         # Only generate chart if at least 2 distinct data points exist for a metric
         active_points = rev_points if len(rev_points) >= 2 else (prof_points if len(prof_points) >= 2 else None)
@@ -130,7 +129,7 @@ class ChartGenerator:
                 title="Financial Performance & Operating Trend",
                 caption=f"Multi-year trajectory of reported {metric_name.lower()} across documented reporting cycles.",
                 image_path=img_path,
-                source_line="Source: Verified Corporate Annual Reports & Statutory Financial Filings"
+                source_line="Source: Target-company verified facts ledger; periods and units as reported."
             )
         except Exception as e:
             print(f"[Chart Error] {e}")
@@ -143,6 +142,7 @@ class ChartGenerator:
             return None
 
         segments: List[Tuple[str, float]] = []
+        metric_label = ""
         try:
             with sqlite3.connect(storage.db_path, timeout=30) as conn:
                 cur = conn.cursor()
@@ -155,14 +155,20 @@ class ChartGenerator:
                     continue
                 header = lines[0].lower()
                 if any(k in header for k in ("segment", "division", "business line", "geography")):
+                    headers = [c.strip().lower() for c in lines[0].strip("|").split("|")]
+                    metric_idx = next((i for i, h in enumerate(headers[1:], start=1)
+                                       if any(k in h for k in ("revenue", "sales", "assets", "profit", "income", "amount", "value"))), None)
+                    if metric_idx is None:
+                        continue
+                    metric_label = headers[metric_idx]
                     # Parse data rows
                     for l in lines[2:]:
                         parts = [c.strip() for c in l.strip("|").split("|")]
-                        if len(parts) >= 2:
+                        if len(parts) > metric_idx:
                             name = parts[0]
                             if any(k in name.lower() for k in ("total", "sum", "elimination", "unallocated", "notes")):
                                 continue
-                            val = clean_number(parts[1])
+                            val = clean_number(parts[metric_idx])
                             if val is not None and val > 0:
                                 segments.append((name, val))
                     if len(segments) >= 2:
@@ -200,7 +206,8 @@ class ChartGenerator:
             ax.set_yticks(y_pos)
             ax.set_yticklabels(names, fontsize=9, fontweight="medium")
             ax.invert_yaxis()
-            ax.set_xlabel("Contribution / Revenue", fontsize=9, fontweight="medium", color="#334155")
+            metric_title = metric_label.title() or "Reported Amount"
+            ax.set_xlabel(metric_title, fontsize=9, fontweight="medium", color="#334155")
             ax.set_title("Operational & Segment Contribution Breakdown", fontsize=11, fontweight="bold", color="#0F172A", pad=10)
 
             for bar in bars:
@@ -219,10 +226,10 @@ class ChartGenerator:
 
             return ChartArtifact(
                 chart_id="chart_seg_mix",
-                title="Operational Segment Breakdown",
-                caption="Distribution of operating revenues and divisional contributions across key business lines.",
+                title=f"Segment Breakdown by {metric_title}",
+                caption=f"Reported {metric_title.lower()} by disclosed business or geographic segment.",
                 image_path=img_path,
-                source_line="Source: Primary Audited Financial Statement Notes & Segment Disclosures"
+                source_line="Source: Target-company segment table in indexed source documents."
             )
         except Exception as e:
             print(f"[Chart Error] {e}")

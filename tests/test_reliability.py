@@ -115,22 +115,19 @@ class TestReliabilityEnhancements(unittest.TestCase):
         self.assertIn("https://sec.gov/leaked-draft-2024.pdf", reloaded_session.rejected_sources)
         self.assertFalse(reloaded_session.is_domain_approved("https://unverified-blog.com/news.html"))
 
-    def test_first_year_dossier_validation_and_prior_year_guard(self):
-        """Test inaugural dossier validation for missing fields and rejection of fabricated prior figures."""
-        # Missing fields test
+    def test_flexible_dossier_retains_prior_period_information_as_unverified(self):
+        """Test flexible intake and retention of comparative information for verification."""
         incomplete_fields = {
             "business_model": "Autonomous cloud edge infrastructure solutions.",
             "revenue": "$5,000,000",
             # Missing registration_id, incorporation_date, initial_capital, expenses, net_profit, cash
         }
         res1 = json.loads(self.tools["create_cold_start_dossier"].invoke({"fields": incomplete_fields}))
-        self.assertFalse(res1["dossier_complete"])
-        missing_keys = [m["field"] for m in res1["missing_required_fields"]]
-        self.assertIn("registration_id", missing_keys)
-        self.assertIn("incorporation_date", missing_keys)
-        self.assertIn("initial_capital", missing_keys)
+        self.assertTrue(res1["information_received"])
+        self.assertEqual(res1["fields_recorded"], 2)
+        self.assertNotIn("missing_required_fields", res1)
 
-        # Prior year fabrication guard test
+        # Preserve prior-period claims, but label the dossier as company-provided.
         fields_with_prior = {
             "registration_id": "US-DEL-2024-991",
             "incorporation_date": "10-January-2024",
@@ -143,9 +140,11 @@ class TestReliabilityEnhancements(unittest.TestCase):
             "prior_year_revenue": "$3,000,000",  # Fabricated prior figure
         }
         res2 = json.loads(self.tools["create_cold_start_dossier"].invoke({"fields": fields_with_prior}))
-        self.assertTrue(res2["dossier_complete"])
-        self.assertEqual(len(res2["prior_year_violations_rejected"]), 1)
-        self.assertIn("prior_year_revenue", res2["prior_year_violations_rejected"])
+        self.assertTrue(res2["information_received"])
+        self.assertEqual(res2["fields_recorded"], len(fields_with_prior))
+        dossier = self.session.storage.search("prior_year_revenue", k=1, doc_ids=[res2["doc_id"]])
+        self.assertTrue(dossier)
+        self.assertIn("Company-provided information", dossier[0][0].text)
 
     def test_regulatory_coverage_matrix_tool(self):
         """Test statutory and industry benchmark coverage checking."""
@@ -157,9 +156,10 @@ class TestReliabilityEnhancements(unittest.TestCase):
             f.write("# Management Discussion and Analysis (MD&A)\n\n" + " ".join(["operational_word"] * 180))
 
         cov = json.loads(self.tools["check_regulatory_coverage"].invoke({"sector": "technology"}))
-        self.assertIn("coverage_score", cov)
-        self.assertGreater(cov["met_requirements_count"], 0)
-        self.assertGreater(cov["missing_count"], 0)
+        self.assertIn("registry_match_ratio", cov)
+        self.assertFalse(cov["is_legal_compliance_certified"])
+        self.assertGreater(cov["met_registry_matches_count"], 0)
+        self.assertGreater(cov["missing_registry_matches_count"], 0)
         met_reqs = [m["requirement"] for m in cov["met_sample"]]
         self.assertTrue(any("Management Discussion" in r or "MD&A" in r for r in met_reqs))
 

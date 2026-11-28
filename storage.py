@@ -18,8 +18,13 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import chromadb
-from chromadb.config import Settings as ChromaSettings
+try:
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+except Exception as _e:   # e.g. grpc DLL blocked by Windows Application Control
+    chromadb = None
+    ChromaSettings = None
+    print(f"[Warning] ChromaDB unavailable, using keyword-only search: {_e}")
 
 from config import settings
 
@@ -126,6 +131,10 @@ class DatabaseStorageEngine:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id);")
 
     def _init_chroma(self) -> None:
+        if chromadb is None:
+            self.chroma_client = None
+            self.collection = None
+            return
         self.chroma_client = chromadb.PersistentClient(
             path=self.chroma_dir,
             settings=ChromaSettings(anonymized_telemetry=False, is_persistent=True)
@@ -195,6 +204,18 @@ class DatabaseStorageEngine:
                      matches_period: Optional[bool] = None, urls: Sequence[str] = ()) -> int:
         """Process document into chunks, persistently storing in SQLite and indexing in ChromaDB."""
         with self._lock:
+            # Replacing a source must remove its previous chunks and vectors first;
+            # otherwise shorter revisions leave stale trailing chunks searchable.
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
+                old_ids = [row[0] for row in conn.execute(
+                    "SELECT chunk_id FROM chunks WHERE doc_id = ?", (doc_id,)
+                ).fetchall()]
+            if old_ids:
+                self.collection.delete(ids=old_ids)
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
+                conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+                conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+
             # 1. Register Document in SQLite
             with sqlite3.connect(self.db_path, timeout=30) as conn:
                 conn.execute(
@@ -240,6 +261,8 @@ class DatabaseStorageEngine:
                 )
 
             # 4. Embed and Index in ChromaDB
+            if self.collection is None:
+                return len(chunks)
             ids = [c.chunk_id for c in chunks]
             documents = [c.text for c in chunks]
             metadatas = [{
@@ -265,18 +288,6 @@ class DatabaseStorageEngine:
             return len(chunks)
 
     # ------------------------------------------------------------------ search
-    def _is_financial_or_numeric_query(self, query: str) -> bool:
-        """Check if query contains digits or common financial metric terms."""
-        if re.search(r"\d", query):
-            return True
-        financial_terms = {
-            "revenue", "profit", "ebitda", "ebit", "loss", "turnover", "margin", "income",
-            "expense", "assets", "liabilities", "equity", "debt", "cash", "dividend",
-            "eps", "share", "balance", "capital", "expenditure", "capex", "opex",
-            "borrowings", "crore", "lakh", "million", "billion", "inr", "usd", "eur", "gbp"
-        }
-        words = set(re.findall(r"\b[A-Za-z]+\b", query.lower()))
-        return bool(words & financial_terms)
 
     def _fts_keyword_search(self, query: str, limit: int = 25,
                             doc_ids: Optional[Sequence[str]] = None,
@@ -320,6 +331,8 @@ class DatabaseStorageEngine:
                        doc_ids: Optional[Sequence[str]] = None,
                        table_only: bool = False) -> List[str]:
         """Perform Chroma vector search over chunks."""
+        if self.collection is None:
+            return []
         total_items = self.collection.count()
         if total_items == 0:
             return []
@@ -442,21 +455,6 @@ class DatabaseStorageEngine:
                         score *= 1.15
 
                 scored_candidates.append((ch, score))
-
-            # 4. Optional Cross-Encoder Reranking
-            if getattr(settings, "RERANK", False):
-                try:
-                    from sentence_transformers import CrossEncoder
-                    if not hasattr(self, "_cross_encoder"):
-                        self._cross_encoder = CrossEncoder(settings.RERANK_MODEL)
-                    pairs = [[query, ch.text] for ch, _ in scored_candidates]
-                    rerank_scores = self._cross_encoder.predict(pairs)
-                    reranked = []
-                    for (ch, _), r_score in zip(scored_candidates, rerank_scores):
-                        reranked.append((ch, float(r_score)))
-                    scored_candidates = reranked
-                except Exception:
-                    pass
 
             # Sort descending by score and return top k
             scored_candidates.sort(key=lambda x: x[1], reverse=True)

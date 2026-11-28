@@ -42,7 +42,7 @@ class EndToEndMockModel(BaseChatModel):
                 "cash_at_bank": "$18,500,000"
             }
             tc = ToolCall(name="create_cold_start_dossier", args={"fields": fields}, id="call_2")
-            msg = AIMessage(content="Creating verified internal corporate dossier for Aether Dynamics Inc.", tool_calls=[tc])
+            msg = AIMessage(content="Indexing company-provided corporate information for Aether Dynamics Inc.", tool_calls=[tc])
             return ChatResult(generations=[ChatGeneration(message=msg)])
 
         # Step 3: Check capacity and build ledger

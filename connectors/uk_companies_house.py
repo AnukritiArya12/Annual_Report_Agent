@@ -58,14 +58,19 @@ class CompaniesHouseConnector(SourceConnector):
                                     desc = f.get("description", "accounts")
                                     matches_fy = bool(target_year and (target_year in date_str or str(int(target_year) + 1) in date_str))
                                     conf = 0.92 if matches_fy else 0.72
-                                    view_url = f"https://find-and-update.company-information.service.gov.uk/company/{co_num}/filing-history"
+                                    document_metadata = f.get("links", {}).get("document_metadata", {}).get("href", "")
+                                    if not document_metadata:
+                                        # A filing-history landing page is not the accounts itself.
+                                        continue
+                                    document_url = document_metadata.rstrip("/") + "/document?format=pdf&download=1"
                                     candidates.append(CandidateDocument(
-                                        url=view_url,
+                                        url=document_url,
                                         title=f"{co_title} ({co_num}) - {desc.replace('-', ' ').title()} ({date_str})",
                                         period=date_str[:4],
                                         confidence=conf,
                                         source_name="UK Companies House API",
-                                        raw_data=f
+                                        raw_data={**f, "company_number": co_num, "entity_name": co_title,
+                                                  "period_match": matches_fy}
                                     ))
                                 candidates.sort(key=lambda c: -c.confidence)
             except Exception:
@@ -81,9 +86,20 @@ class CompaniesHouseConnector(SourceConnector):
             query = f'"{company}" accounts OR "annual report" site:find-and-update.company-information.service.gov.uk'
             hits = self.tools.web_search(query, max_results=3) if self.tools else []
             for h in hits:
+                url = h.get("href", "")
+                host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", url.lower()).split("/", 1)[0])
+                if host != "find-and-update.company-information.service.gov.uk" or "/company/" not in url:
+                    continue
+                if not re.search(r"/document(?:\?|$)", url):
+                    continue
+                title = h.get("title", "")
+                if not all(t.lower() in (title + " " + h.get("body", "")).lower()
+                           for t in re.findall(r"[a-z0-9]+", company)
+                           if t.lower() not in {"ltd", "limited", "plc", "llp", "co", "uk"}):
+                    continue
                 candidates.append(CandidateDocument(
-                    url=h.get("href", ""),
-                    title=h.get("title", f"{company} UK Filing"),
+                    url=url,
+                    title=title or f"{company} UK Filing",
                     period=target_year or fy,
                     confidence=0.75,
                     source_name="UK Companies House",

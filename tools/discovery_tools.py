@@ -306,6 +306,32 @@ def build_discovery_tools(session: ReportSession) -> List[BaseTool]:
         }, indent=2)
 
     @tool
+    def search_company_sources(query: str, max_results: int = 8) -> str:
+        """Search broadly for company information and annual-report sources in any jurisdiction.
+
+        Returns candidate URLs and snippets only. Review the entity, reporting period, and source
+        before ingestion. Remote ingestion still requires domain approval.
+        """
+        raw_hits = session.research_tools.web_search(query, max_results=max(1, min(max_results, 20)))
+        results = []
+        for hit in raw_hits:
+            title = sanitize_untrusted(hit.get("title", ""))
+            snippet = sanitize_untrusted(hit.get("body", ""))
+            url = hit.get("href", "")
+            if not url:
+                continue
+            results.append({
+                "title": title,
+                "url": url,
+                "snippet": snippet[:600],
+                "domain_approved": session.is_domain_approved(url),
+                "target_company_match": mentions_company(
+                    f"{title} {snippet}", session.approved_names
+                ),
+            })
+        return json.dumps({"query": query, "results": results}, indent=2)
+
+    @tool
     def ingest_documents(urls_or_paths: List[str]) -> str:
         """Download (if URL), parse PDF/DOCX (with OCR fallback), sanitize untrusted text, chunk, and index into storage.
 
@@ -329,7 +355,7 @@ def build_discovery_tools(session: ReportSession) -> List[BaseTool]:
                     continue
                 local_path = session.research_tools.download_pdf(src_clean, session.run_dir) or ""
                 if not local_path or not os.path.exists(local_path):
-                    txt = session.research_tools.scrape_url(src_clean) or session.research_tools.fetch_text(src_clean)
+                    txt = session.research_tools.fetch_text(src_clean) or session.research_tools.scrape_url(src_clean)
                     if not txt:
                         rejected.append({"source": src_clean, "reason": "Failed to download or scrape content."})
                         continue
@@ -337,10 +363,18 @@ def build_discovery_tools(session: ReportSession) -> List[BaseTool]:
                     if not mentions_company(safe_txt, session.approved_names):
                         rejected.append({"source": src_clean, "reason": "Content does not mention approved company."})
                         continue
+                    foreign_reason = chunk_foreign_reason(
+                        safe_txt, session.approved_names, session.excluded_names, session.entity_statuses
+                    )
+                    if foreign_reason:
+                        rejected.append({"source": src_clean, "reason": f"Content failed the entity guard: {foreign_reason}."})
+                        continue
                     doc_id = slug(src_clean)[:48]
-                    session.storage.add_document(doc_id, src_clean[:80], src_clean, [(1, safe_txt)])
-                    ingested.append({"doc_id": doc_id, "source": src_clean, "pages": 1})
-                    session.update_manifest("document_ingested", {"doc_id": doc_id, "source": src_clean, "pages": 1})
+                    from knowledge import _html_to_pages
+                    web_pages = _html_to_pages(safe_txt) or [(1, safe_txt)]
+                    session.storage.add_document(doc_id, src_clean[:80], src_clean, web_pages)
+                    ingested.append({"doc_id": doc_id, "source": src_clean, "pages": len(web_pages)})
+                    session.update_manifest("document_ingested", {"doc_id": doc_id, "source": src_clean, "pages": len(web_pages)})
                     continue
             else:
                 local_path = src_clean
@@ -364,6 +398,25 @@ def build_discovery_tools(session: ReportSession) -> List[BaseTool]:
                     continue
 
                 safe_pages = [(p_no, sanitize_untrusted(txt)) for p_no, txt in pages]
+                source_text = "\n".join(text for _, text in safe_pages)
+                if not mentions_company(source_text, session.approved_names):
+                    rejected.append({
+                        "source": src_clean,
+                        "reason": (
+                            "Document content does not identify the target company. It was not ingested. "
+                            "Verify the legal entity or confirm a legitimate company alias before retrying."
+                        ),
+                    })
+                    continue
+                foreign_reason = chunk_foreign_reason(
+                    source_text,
+                    session.approved_names,
+                    session.excluded_names,
+                    session.entity_statuses,
+                )
+                if foreign_reason:
+                    rejected.append({"source": src_clean, "reason": f"Document failed the entity guard: {foreign_reason}."})
+                    continue
                 doc_id = slug(os.path.basename(local_path))[:48]
                 session.storage.add_document(doc_id, os.path.basename(local_path), src_clean, safe_pages)
                 ingested.append({"doc_id": doc_id, "source": src_clean, "pages": n_pages})
@@ -412,78 +465,113 @@ def build_discovery_tools(session: ReportSession) -> List[BaseTool]:
         }, indent=2)
 
     @tool
-    def create_cold_start_dossier(fields: Dict[str, str]) -> str:
-        """Create, validate, and index an internal corporate dossier for a company with no public filings.
+    def create_cold_start_dossier(fields: Dict[str, str], source_label: str = "user-provided") -> str:
+        """Index any user-provided company information for a first-time or private-company report.
 
-        GUARDRAIL: Audits for missing required inaugural disclosures (registration ID, incorporation date,
-        business model, capital, revenue, expenses, net profit, cash balance).
-        Strictly forbids fabricated prior-year comparative figures.
+        Accepts whatever verified details are available (narrative, operating metrics, financial data,
+        governance, risks, plans, or history). Missing fields are reported as gaps, not treated as blockers.
+        Prior-period information is retained as management-provided and must be verified before use.
         """
         juri = get_jurisdiction(session.country)
         co = session.company_name
         fy = session.financial_year
 
-        # 1. First-year field validation
-        required_keys = [
-            ("registration_id", "Statutory registration number / corporate ID / CIN"),
-            ("incorporation_date", "Date of legal incorporation / genesis charter"),
-            ("business_model", "Description of primary operating model and commercial activity"),
-            ("initial_capital", "Committed initial paid-up founder equity capital"),
-            ("revenue", "Inaugural turnover / revenue from operations"),
-            ("expenses", "Total operating expenditures incurred during the period"),
-            ("net_profit", "Net profit or loss after tax for inaugural period"),
-            ("cash_at_bank", "Closing cash and bank liquidity at period end"),
-        ]
-
+        # Keep the intake open-ended: first-time companies differ in what information exists.
         safe_fields: Dict[str, str] = {}
-        missing_fields: List[Dict[str, str]] = []
-        prior_year_violations: List[str] = []
-
         raw_dict = fields or {}
         for k, v in raw_dict.items():
-            k_low = k.strip().lower()
-            # Detect prior-year fabrication attempts
-            if any(py in k_low for py in ("prior", "previous", "last_year", "fy23", "fy22", "fy21", "comparative")):
-                prior_year_violations.append(k)
-                continue
             safe_fields[k] = sanitize_untrusted(str(v))
 
-        for req_k, req_desc in required_keys:
-            if not any(req_k in k.lower() for k in safe_fields.keys()):
-                missing_fields.append({"field": req_k, "description": req_desc})
-
         lines = [
-            f"# {co} - Verified Internal Dossier ({fy})",
+            f"# {co} - Company Information Dossier ({fy})",
             f"Jurisdiction: {juri.country_name} ({juri.regime_name})",
-            "Reporting Status: First-Year / Inaugural Operations (Prior Periods: N/A)",
+            f"Information source: {sanitize_untrusted(source_label)}",
+            "Information status: Company-provided information; verify material claims against available records and identify unsupported items.",
             "",
         ]
         for k, v in safe_fields.items():
             lines.append(f"- **{k.replace('_', ' ').title()}**: {v}")
 
-        if prior_year_violations:
-            lines.append("")
-            lines.append(
-                "NOTE ON PRIOR PERIODS: First-year inaugural company. Under statutory framework, "
-                "prior comparative columns are strictly 'N/A (First Year of Operations)'. Fabricated prior figures rejected."
-            )
+        lines.append("")
+        lines.append("Information not supplied in this dossier is unknown; it is not evidence that the company had no activity or obligation.")
 
-        doc_id = f"dossier_{slug(co)}"
+        doc_id = f"dossier_{slug(co)}_{slug(fy)}"
         session.storage.add_document(doc_id, f"Internal Dossier ({co})", "internal://dossier", [(1, "\n".join(lines))])
         session.update_manifest("dossier_indexed", {
             "doc_id": doc_id,
             "fields_count": len(safe_fields),
-            "missing_fields_count": len(missing_fields),
+            "source_label": source_label,
         })
 
         return json.dumps({
             "status": "indexed",
             "doc_id": doc_id,
             "fields_recorded": len(safe_fields),
-            "missing_required_fields": missing_fields,
-            "prior_year_violations_rejected": prior_year_violations,
-            "dossier_complete": len(missing_fields) == 0,
+            "information_received": bool(safe_fields),
+            "coverage_status": "PARTIAL; completeness depends on the report scope and source coverage.",
             "total_chunks_in_storage": session.storage.total_chunks(),
+        }, indent=2)
+
+    @tool
+    def request_management_input(
+        question: str,
+        respondent_role: str,
+        report_topics: Optional[List[str]] = None,
+        why_needed: str = "",
+    ) -> str:
+        """Ask a company founder, executive, or team for missing first-report information.
+
+        The CLI pauses for a free-text answer. The answer is indexed as management-provided
+        information, not independently verified. Ask specific, material questions and identify
+        the expected respondent. Use only when available records do not answer the question.
+        """
+        from langgraph.types import interrupt
+
+        payload = {
+            "kind": "management_input",
+            "question": question,
+            "respondent_role": respondent_role,
+            "report_topics": report_topics or [],
+            "why_needed": why_needed,
+        }
+        answer = interrupt(payload)
+        answer_text = sanitize_untrusted(str(answer or "")).strip()
+        if not answer_text:
+            return json.dumps({"status": "NO_INFORMATION_PROVIDED", "question": question})
+
+        answer_doc = "\n".join([
+            f"# Management Interview: {respondent_role}",
+            f"Company: {session.company_name}",
+            f"Reporting period: {session.financial_year}",
+            f"Question: {sanitize_untrusted(question)}",
+            f"Topics: {', '.join(report_topics or [])}",
+            "Source status: Management-provided; not independently verified.",
+            "Answer:",
+            answer_text,
+        ])
+        answer_id = f"management_input_{slug(respondent_role)}_{slug(question)[:32]}"
+        chunks = session.storage.add_document(
+            answer_id,
+            f"Management interview - {respondent_role}",
+            "internal://management-interview",
+            [(1, answer_doc)],
+            kind="management_interview",
+            fiscal_year=session.financial_year,
+            matches_period=True,
+        )
+        session.update_manifest("management_input_recorded", {
+            "doc_id": answer_id,
+            "respondent_role": respondent_role,
+            "topics": report_topics or [],
+            "why_needed": why_needed,
+            "independently_verified": False,
+        })
+        return json.dumps({
+            "status": "RECORDED_AS_MANAGEMENT_PROVIDED",
+            "doc_id": answer_id,
+            "respondent_role": respondent_role,
+            "chunks_indexed": chunks,
+            "verification_status": "NOT_INDEPENDENTLY_VERIFIED",
         }, indent=2)
 
     @tool
@@ -510,8 +598,10 @@ def build_discovery_tools(session: ReportSession) -> List[BaseTool]:
     return [
         resolve_company_identity,
         find_source_documents,
+        search_company_sources,
         ingest_documents,
         web_search_approved,
         create_cold_start_dossier,
+        request_management_input,
         research_industry_peers,
     ]

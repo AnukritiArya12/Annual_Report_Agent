@@ -88,7 +88,7 @@ def compute_evidence_grounding(md_text: str, run_dir: str) -> float:
     if not numbers_in_report:
         return 1.0  # No numbers → trivially grounded
 
-    db_path = os.path.join(run_dir, "kb.db")
+    db_path = os.path.join(run_dir, "evidence.db") if os.path.exists(os.path.join(run_dir, "evidence.db")) else os.path.join(run_dir, "kb.db")
     ledger_numbers: set = set()
     if os.path.exists(db_path):
         try:
@@ -180,7 +180,7 @@ def count_foreign_entity_flags(run_dir: str) -> int:
 
 def count_ledger_violations(run_dir: str) -> int:
     """Count ledger consistency violations by scanning ledger facts for CONFLICTING status."""
-    db_path = os.path.join(run_dir, "kb.db")
+    db_path = os.path.join(run_dir, "evidence.db") if os.path.exists(os.path.join(run_dir, "evidence.db")) else os.path.join(run_dir, "kb.db")
     if not os.path.exists(db_path):
         return 0
     try:

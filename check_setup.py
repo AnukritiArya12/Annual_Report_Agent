@@ -28,7 +28,6 @@ CORE_FILES = {
     "statements.py": "extract_structured_statements",
     "storage.py": "class DatabaseStorageEngine",
     "utils.py": "def sanitize_untrusted",
-    "validator.py": "class DynamicValidator",
 }
 
 TOOL_FILES = [
@@ -44,6 +43,7 @@ TOOL_FILES = [
 ]
 
 SKILL_DIRS = [
+    "annual-report-workflow",
     "source-discovery",
     "cold-start-company",
     "report-planning",
@@ -57,6 +57,8 @@ PACKAGES = [
     ("deepagents", "deepagents"),
     ("langchain", "langchain"),
     ("langgraph", "langgraph"),
+    ("langgraph.checkpoint.sqlite", "langgraph-checkpoint-sqlite"),
+    ("langchain_google_genai", "langchain-google-genai"),
     ("requests", "requests"),
     ("bs4", "beautifulsoup4"),
     ("ddgs", "ddgs"),
@@ -66,7 +68,6 @@ PACKAGES = [
     ("reportlab", "reportlab"),
     ("chromadb", "chromadb"),
     ("PIL", "pillow"),
-    ("rank_bm25", "rank_bm25"),
     ("matplotlib", "matplotlib"),
 ]
 
@@ -151,14 +152,14 @@ else:
 print("\nENVIRONMENT CONFIGURATION (.env)")
 env_path = os.path.join(HERE, ".env")
 if not os.path.exists(env_path):
-    print("  WARNING   .env not found. Create .env with GEMINI_API_KEY or LLM_PROVIDER=ollama.")
+    print("  WARNING   .env not found. Create .env with GEMINI_API_KEY=your_key.")
 else:
     txt = open(env_path, encoding="utf-8", errors="ignore").read().lower()
-    has_key = "gemini_api_key=" in txt or "llm_provider=ollama" in txt.replace(" ", "")
+    has_key = "gemini_api_key=" in txt
     if has_key:
         print("  ok        .env found with valid provider credentials")
     else:
-        print("  WARNING   .env found but no active API key or provider configured")
+        print("  WARNING   .env found but GEMINI_API_KEY is missing")
 
 print("\n" + ("=" * 60))
 if ok:

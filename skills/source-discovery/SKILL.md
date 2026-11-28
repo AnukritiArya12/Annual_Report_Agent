@@ -1,28 +1,55 @@
 ---
 name: source-discovery
-description: Locate, filter, rank, and ingest authentic corporate filings and official documents for any company.
+description: Protocols for primary source discovery, local file ingestion, cold-start handling, and building the canonical facts ledger without relying on internet access.
 ---
 
-# Source Discovery Skill
+# Source Discovery & Knowledge Grounding Skill
 
-## NAME
-source-discovery
+## Objective
+Establish an authentic, verifiable knowledge base for the target company and reporting period. Maximize utilization of local documents, discover verified statutory filings when available, handle private/new entities through structured cold-start intake, and build the canonical facts ledger.
 
-## OBJECTIVE
-Discover and ingest high-confidence primary corporate documents (annual reports, 10-K/20-F filings, audited financial statements) for the specified company and reporting period while strictly excluding unrelated entities, competitors, and unapproved web domains.
+---
 
-## DECISION RULES
-1. **Analyst Subagent Delegation**: For extensive multi-filing searches or complex peer benchmarking, the coordinator can delegate information gathering to the `research_analyst` subagent via `task(subagent_type="research_analyst", prompt=...)` to keep candidate URLs and raw metadata out of the main orchestrator context.
-2. **Prioritize Explainable Ranking**: Always query `find_source_documents` to obtain multi-factor scored candidates (official status, exact entity, reporting year, scope, completeness, recency). Inspect selected candidates and review rejection reasons in `source_candidates.json`.
-3. **Respect Human Decisions & Whitelisting**: Never ingest an unapproved or rejected web URL. If high-confidence filings reside on an external domain, call `request_human_decision` with `approve_domain="domain.com"` before calling `ingest_documents`. If a human rejects a domain or document, adhere to the rejection permanently.
-4. **Verify Entity Matching**: Verify that candidate titles, registrant names, or accession metadata match the target entity. Treat subsidiaries as distinct from parent entities unless consolidated scope is explicitly requested.
-5. **Local Over Web**: If the user provided local files, ingest them first as authoritative primary records.
+## 1. Operating Protocol
 
-## CONSTRAINTS
-- Zero ingestion of unapproved domains. Unapproved URLs will be dropped by tool guardrails.
-- No company, country, or industry names are hardcoded. Retrieve jurisdiction-specific rules dynamically via `resolve_company_identity`.
-- Do not ingest duplicate filings for the same period.
+### Step 1: Local Documents First (Air-Gapped Operation)
+- If the user provides local files (PDF, DOCX, TXT) via the CLI or UI, ingest them immediately:
+  `ingest_documents([local_file_paths])`
+- **Zero Approval Needed**: Local files do not require internet access or human approval.
+- The storage engine extracts chunks, extracts tables, and populates the SQLite evidence database (`evidence.db`).
 
-## RECOVERY
-- If regulatory connectors yield zero candidates, fall back to `web_search_approved` across already approved domains.
-- If web search yields no candidates or the company is unlisted/pre-IPO, transition immediately to the `cold-start-company` skill.
+### Step 2: Identity Resolution
+- Call `resolve_company_identity(name, country)` to determine:
+  - Official registered legal entity name.
+  - Primary operating country and governing corporate statute (e.g., US SEC, India MCA, UK Companies House).
+  - Corporate structure and sector categorization.
+
+### Step 3: Statutory Document Search (If Online & Remote Mode Permitted)
+- Call `find_source_documents(company, fy)` to discover official filings:
+  - Prioritize authoritative statutory filings: Form 10-K, Annual Report & Accounts, Integrated Annual Report.
+- **Human Decision Gateway**:
+  - Before ingesting any remote web domain, call `request_human_decision` for domain approval (e.g., `approve_domain="sec.gov"`).
+  - If `auto_approve=True` is enabled in settings, domain approval is automatically granted.
+
+### Step 4: Cold-Start Protocol (For Companies with Zero Filings)
+- If no public documents exist:
+  - Call `create_cold_start_dossier(fields=..., source_label="management-provided")`.
+  - Call `request_management_input(question, respondent_role, report_topics)` to interview management on the 5 essential pillars:
+    1. Legal profile and genesis
+    2. Operations and products
+    3. Financial performance and capitalization
+    4. Board governance and leadership
+    5. Key risks and mitigation strategies
+
+### Step 5: Canonical Facts Ledger Construction
+- Call `build_facts_ledger(force=True)`.
+- The ledger extracts verified numeric values with strict digit verification against source text.
+- Inspect `missing_core_keys` and `conflicts` to identify areas requiring management clarification or highlighted disclosures.
+
+---
+
+## 2. Guardrails
+
+- **Zero Fabricated Sources**: Never cite simulated URLs, phantom filings, or unverified documents.
+- **Scope Isolation**: Ensure reporting scope (standalone vs consolidated) matches user intent.
+- **Evidence Boundary**: If evidence volume is low, state the limitation rather than attempting to fill gaps with hallucinated sources.

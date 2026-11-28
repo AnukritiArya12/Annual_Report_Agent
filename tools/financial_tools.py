@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from typing import List, Optional
 from langchain_core.tools import BaseTool, tool
 
@@ -47,7 +48,10 @@ def build_financial_tools(session: ReportSession) -> List[BaseTool]:
 
         Returns exact values, periods, source documents, page numbers, and status.
         """
-        facts = session.ledger.get_all_facts()
+        facts = [
+            f for f in session.ledger.get_all_facts()
+            if f.scope.strip().lower() == session.reporting_scope.strip().lower()
+        ]
         if keys:
             key_set = {k.strip().lower() for k in keys}
             facts = [f for f in facts if f.key.lower() in key_set]
@@ -95,17 +99,21 @@ def build_financial_tools(session: ReportSession) -> List[BaseTool]:
             })
 
         if num_val is not None and chunk_id:
-            # Verify digit sequence exists in cited chunk
-            hits = session.storage.search(value, k=5)
-            matched_chunk = next((c for c, _ in hits if c.chunk_id == chunk_id), None)
-            if matched_chunk is not None:
-                main_digits = re.sub(r"[^\d]", "", str(int(abs(num_val))))
-                chunk_clean = re.sub(r"[^\d]", "", matched_chunk.text)
-                if len(main_digits) >= 2 and main_digits not in chunk_clean:
-                    return json.dumps({
-                        "status": "REJECTED",
-                        "reason": f"Digits '{main_digits}' do not appear literally in cited chunk {chunk_id}.",
-                    })
+            # Verify digit sequence exists in the cited chunk (looked up directly by chunk_id)
+            with sqlite3.connect(session.storage.db_path, timeout=30) as conn:
+                row = conn.execute("SELECT text FROM chunks WHERE chunk_id = ?", (chunk_id,)).fetchone()
+            if row is None:
+                return json.dumps({
+                    "status": "REJECTED",
+                    "reason": f"Cited chunk {chunk_id} was not found in the indexed evidence.",
+                })
+            main_digits = re.sub(r"[^\d]", "", str(int(abs(num_val))))
+            chunk_clean = re.sub(r"[^\d]", "", row[0] or "")
+            if len(main_digits) >= 2 and main_digits not in chunk_clean:
+                return json.dumps({
+                    "status": "REJECTED",
+                    "reason": f"Digits '{main_digits}' do not appear literally in cited chunk {chunk_id}.",
+                })
 
         rec = FactRecord(
             key=key,

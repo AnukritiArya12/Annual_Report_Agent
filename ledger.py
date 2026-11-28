@@ -10,18 +10,14 @@ Flags conflicting values for the same key + period across sources.
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional
 
-from config import settings
 from financial import clean_number
 from storage import DatabaseStorageEngine
-from utils import extract_json
 
 
 class FactStatus(str, Enum):
@@ -67,7 +63,7 @@ class FactRecord:
 class FactsLedger:
     """Manages verified canonical metrics extracted from retrieved document chunks."""
 
-    def __init__(self, storage: Optional[DatabaseStorageEngine] = None, db_path: Optional[str] = None, llm: Optional[Any] = None):
+    def __init__(self, storage: Optional[DatabaseStorageEngine] = None, db_path: Optional[str] = None):
         if storage is not None:
             self.storage = storage
             self.db_path = storage.db_path
@@ -76,7 +72,6 @@ class FactsLedger:
             self.db_path = db_path
         else:
             raise ValueError("Must provide either storage or db_path to FactsLedger")
-        self.llm = llm
         self._init_sqlite()
 
     def _init_sqlite(self) -> None:
@@ -133,7 +128,7 @@ class FactsLedger:
         found_keys = {
             f.key for f in all_facts
             if (f.numeric_value is not None or (f.value and f.value.strip()))
-            and (not tp_low or tp_low in f.period.lower() or f.period.lower() in tp_low)
+            and (not tp_low or (f.period and (tp_low in f.period.lower() or f.period.lower() in tp_low)))
         }
         return [k for k in CORE_METRIC_KEYS if k not in found_keys]
 
@@ -156,10 +151,13 @@ class FactsLedger:
         """
         all_existing = self.get_all_facts()
         fy_low = financial_year.strip().lower()
-        if not force and any(fy_low in f.period.lower() or f.period.lower() in fy_low for f in all_existing):
+        if not force and any(f.period and (fy_low in f.period.lower() or f.period.lower() in fy_low) for f in all_existing):
             print(f"  [Facts Ledger] Using existing canonical facts for {financial_year}.")
             return len(all_existing)
 
+        if self.storage is None:
+            print("  [Facts Ledger] No storage attached; cannot build ledger.")
+            return 0
         print(f"  [Facts Ledger] Extracting canonical core metrics for {company_name} ({financial_year})...")
         added_count = 0
 
@@ -190,14 +188,14 @@ class FactsLedger:
                 chunk_text = chunk.text
                 extracted_data = None
 
-                # 1. Fast deterministic regex extraction
+                # Deterministic regex extraction (no LLM: numbers must come from the document text)
                 pats = patterns_map.get(metric_key, [metric_key.replace("_", r"\s+")])
                 for p in pats:
-                    m = re.search(rf"(?:[-*]\s*)?(?:\*\*)?({p})(?:\*\*)?\s*[:|=]\s*([^\n\r]+)", chunk_text, re.IGNORECASE)
+                    m = re.search(rf"(?:[-*]\s*)?(?:\*\*)?\b({p})\b(?:\*\*)?\s*[:|=]\s*([^\n\r]+)", chunk_text, re.IGNORECASE)
                     if not m:
                         m = re.search(rf"\|\s*({p})\s*\|\s*([^|\n\r]+)", chunk_text, re.IGNORECASE)
                     if m:
-                        val_str = m.group(2).strip().strip("*").strip()
+                        val_str = m.group(2).split("|")[0].strip().strip("*").strip()
                         extracted_data = {
                             "found": True,
                             "metric_name": metric_key,
@@ -209,36 +207,6 @@ class FactsLedger:
                             "confidence": 0.95,
                         }
                         break
-
-                # 2. LLM fallback if deterministic regex did not match
-                if not extracted_data and self.llm is not None:
-                    user_prompt = f"""Extract the metric '{metric_key}' from the following evidence excerpt for {company_name} in {financial_year}.
-CRITICAL RULE: The extracted number MUST be literally present in the excerpt. If not found, return {{"found": false}}.
-
-Evidence excerpt (Chunk {chunk.chunk_id}, p.{chunk.page}):
-{chunk_text[:3000]}
-
-Return JSON only:
-{{
-  "found": true | false,
-  "metric_name": "{metric_key}",
-  "raw_string_value": "e.g. INR 12,345 Crore",
-  "numeric_value": 12345.0,
-  "unit": "e.g. Crore, Million, or none",
-  "currency": "e.g. INR, USD, or none",
-  "reporting_period": "e.g. {financial_year}",
-  "confidence": 0.9
-}}"""
-                    try:
-                        resp = self.llm.invoke([
-                            {"role": "system", "content": "You are a corporate financial data auditor. Extract factual metrics strictly matching cited evidence. Return valid JSON only."},
-                            {"role": "user", "content": user_prompt}
-                        ])
-                        parsed = extract_json(resp.content)
-                        if isinstance(parsed, dict) and parsed.get("found"):
-                            extracted_data = parsed
-                    except Exception:
-                        pass
 
                 if not extracted_data or not extracted_data.get("found"):
                     continue
@@ -266,21 +234,29 @@ Return JSON only:
                     conf = float(data.get("confidence") or sc)
 
                     # Check for duplicate from exact same chunk+period
-                    if any(f.key == metric_key and f.period.lower() == period_val.lower() and f.chunk_id == chunk.chunk_id for f in all_existing):
+                    if any(f.key == metric_key and f.scope.lower() == reporting_scope.lower()
+                           and f.chunk_id == chunk.chunk_id for f in all_existing):
                         continue
 
                     # Check for conflicts against existing facts with same key + period
-                    status = FactStatus.REPORTED
+                    # Management answers can inform drafting but are not
+                    # independently verified financial records.
+                    status = (
+                        FactStatus.UNVERIFIED
+                        if chunk.url.startswith("internal://management-interview")
+                        else FactStatus.REPORTED
+                    )
                     for f in all_existing:
-                        if f.key == metric_key and f.period.lower() == period_val.lower():
+                        if (f.key == metric_key and f.period.lower() == period_val.lower()
+                                and f.scope.lower() == reporting_scope.lower()):
                             if f.numeric_value is not None and num_val is not None:
                                 diff = abs(f.numeric_value - num_val)
                                 if diff > 0.05 * (abs(f.numeric_value) + 1e-6) and diff > 1.0:
                                     status = FactStatus.CONFLICTING
                                     f.status = FactStatus.CONFLICTING
                                     with sqlite3.connect(self.db_path, timeout=30) as conn:
-                                        conn.execute("UPDATE facts SET status = ? WHERE key = ? AND period = ?",
-                                                     (FactStatus.CONFLICTING.value, metric_key, period_val))
+                                        conn.execute("UPDATE facts SET status = ? WHERE key = ? AND period = ? AND lower(scope) = lower(?)",
+                                                     (FactStatus.CONFLICTING.value, metric_key, period_val, reporting_scope))
 
                     rec = FactRecord(
                         key=metric_key,
@@ -304,29 +280,3 @@ Return JSON only:
 
         print(f"  [Facts Ledger] Recorded {added_count} canonical facts in SQLite.")
         return added_count
-
-    def format_canonical_block(self, task_queries: Sequence[str]) -> str:
-        """Format relevant canonical facts as a prompt block to constrain writer agents."""
-        facts = self.get_all_facts()
-        if not facts:
-            return ""
-
-        query_str = " ".join(task_queries).lower()
-        selected: List[FactRecord] = []
-        for f in facts:
-            k_clean = f.key.replace("_", " ")
-            if k_clean in query_str or any(word in query_str for word in k_clean.split()):
-                selected.append(f)
-
-        if not selected:
-            # Include top financial facts by default
-            selected = [f for f in facts if f.key in ("revenue", "operating_profit", "net_profit", "total_assets")][:5]
-
-        if not selected:
-            return ""
-
-        lines = ["CANONICAL FACTS (The authoritative values below are verified from primary sources. You MUST use exactly these values and NEVER contradict them):"]
-        for f in selected:
-            page_info = f"p.{f.page}" if f.page else "doc"
-            lines.append(f"- {f.key.replace('_', ' ').title()} ({f.period}): {f.value} [{f.status.value}] ({f.source_doc_id}, {page_info})")
-        return "\n".join(lines)

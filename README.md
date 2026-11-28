@@ -1,16 +1,15 @@
-# Autonomous DeepAgent Annual Report Architect
-*Universal Enterprise-Grade DeepAgent for Corporate Reporting*
+# Autonomous Annual Report Agent
 
-An autonomous deep agent built on LangChain **DeepAgents** (`deepagents.create_deep_agent`) that plans, researches, writes, audits, and compiles publication-grade annual reports for **any company in any jurisdiction**.
+An autonomous agent built on LangChain **DeepAgents** (`deepagents.create_deep_agent`) that researches, writes, reviews, and compiles annual reports. It adapts the report structure and depth to the company, applicable reporting requirements, user purpose, and evidence available. Jurisdiction connectors and requirement data are currently limited to those implemented in this repository; unsupported cases use the generic fallback and require source-based judgment.
 
-Given a company name, financial year, and country, the agent itself decides what to research, what to include, what to skip, how many chapters the report needs, how deep each chapter goes, and when to consult a human. Report length scales authentically with available evidence—a first-year startup or small private entity will produce a concise report (~5–15 pages), whereas a large listed enterprise may span 100 to 300+ pages. Zero boilerplate padding. Zero hallucinated numbers.
+Given a company name, financial year, and optional country, the agent follows the recognizable annual-report arc—from company overview to strategy, operations, governance, risks, financial performance, and applicable disclosures—while adapting its sections to the business and reporting framework. It can use local company records without internet access, and can use another company's report as a structure-only reference. Its configurable maximum is 500 pages; that is a ceiling, not a target, and the evidence must support the report's depth.
 
 ---
 
 ## Architecture Overview
 
 ```
-app.py                CLI runner & Human-in-the-Loop interrupt handler
+app.py                CLI runner, human-approval prompts, page-count progress
 agent.py              build_annual_report_agent — single DeepAgent via create_deep_agent
 ├── tools/            Deterministic tool layer (code owns facts)
 │   ├── discovery_tools.py   resolve_company_identity, find_source_documents, ingest_documents, etc.
@@ -23,37 +22,37 @@ agent.py              build_annual_report_agent — single DeepAgent via create_
 │   └── web.py               Downloader, web search, scraper with prompt injection sanitization
 ├── skills/           Agent Skills standard (SKILL.md with YAML frontmatter)
 │   ├── source-discovery/    Official filing discovery & source ranking
-│   ├── cold-start-company/  Internal dossier compilation for first-year/unlisted entities
+│   ├── cold-start-company/  Flexible information intake for first-time/private entities
 │   ├── report-planning/     Dynamic chapter architecture calibrated to evidence capacity
 │   ├── section-writing/     Strict evidence-grounded drafting and citation
 │   ├── financial-reporting/ Canonical ledger adherence and financial tables
 │   ├── validation-and-revision/ 5-tier audit rules & revision directives
 │   └── human-approval/      Risk-based human decision escalation protocols
-├── connectors/       Jurisdiction filing connectors (SEC EDGAR, India BSE/NSE, UK Companies House, IR)
-├── jurisdictions.py  Jurisdiction registry (US, IN, UK, EU, SG, JP, Generic)
-├── ledger.py         FactsLedger (SQLite-backed multi-period canonical facts with digit verification)
+├── connectors/       Jurisdiction filing connectors plus generic investor-relations discovery
+├── jurisdictions.py  Finite jurisdiction registry; unsupported regimes require source verification
+├── ledger.py         FactsLedger (SQLite-backed canonical facts, regex-extracted, digit-verified)
 ├── statements.py     Deterministic financial highlights summaries (derived from verified facts)
 ├── financial.py      Arithmetic reconciliation engine (Assets = Liabilities + Equity, P&L, Cash Flow)
 ├── charts.py         Headless matplotlib charts (generated ONLY when >= 2 authentic data points exist)
-└── assembler.py      Multi-format publisher (Markdown -> DOCX + PDF with TOC & Audit Appendix)
+└── assembler.py      Markdown, DOCX, and PDF export utilities
 ```
 
 ---
 
 ## Non-Negotiable Core Principles
 
-1. **One Autonomous Deep Agent**: No fixed chapter list, no procedural pipeline scripts, and no hardcoded step sequences. The agent plans its own work using its todo list, saves drafts on disk via filesystem tools, and uses the built-in general-purpose subagent (`task`) when focused delegation is needed.
-2. **Zero Hardcoding**: No company names, industry lists, country-specific rules, or statutory acts hardcoded in code. Jurisdiction rules are loaded at runtime from `jurisdictions.py`.
+1. **Adaptive Agent**: DeepAgents chooses research, drafting, and delegation based on the company and source material.
+2. **No Company-Specific Hardcoding**: Company names are not embedded in entity checks. Applicable laws, industry disclosures, and accounting rules must be verified from authoritative sources; local registries are discovery aids, not universal coverage.
 3. **Code Owns Facts**: The LLM writes prose and plans. All mathematical verifications, domain whitelists, entity guardrails, and digit audits live inside deterministic tools.
-4. **Authentic Length Scaling**: Output length follows authentic evidence capacity. Gaps are explicitly stated as *"Not disclosed in the sources reviewed"* rather than guessed or padded with generic boilerplate.
-5. **Human-in-the-Loop (HITL)**: Risky decisions pause execution using DeepAgents interrupt mechanisms (`interrupt_on`), waiting for human confirmation before confirming legal identities, adopting unapproved domains, committing outlines, or publishing. All answers persist in SQLite so runs can resume seamlessly.
+4. **Evidence-Led Scope**: Report length and organization follow the user's purpose, applicable requirements, and available evidence. Gaps are stated rather than guessed or padded.
+5. **Human-in-the-Loop (HITL)**: The agent requests human input when source-domain restrictions or material ambiguity require it. Decisions and LangGraph checkpoints are persisted to support resuming work.
 
 ---
 
 ## Installation & Setup
 
 ### 1. Prerequisites
-- Python 3.10+ (tested on Python 3.11 and 3.12)
+- Python 3.10+
 - Virtual environment recommended
 
 ### 2. Install Dependencies
@@ -70,15 +69,10 @@ python check_setup.py
 ### 4. Configure Environment
 Create a `.env` file in the root directory:
 ```env
-# Choose provider: ollama | gemini
-LLM_PROVIDER=ollama
-
-# Ollama (local): make sure this model is installed with `ollama pull gpt-oss:20b`
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=gpt-oss:20b
-
-# For Gemini instead, set LLM_PROVIDER=gemini and GEMINI_API_KEY=your_key
-# GEMINI_MODEL=gemini-3.8-flash
+GEMINI_API_KEY=your_key
+GEMINI_MODEL=gemini-2.5-flash-lite
+# Requests per minute sent to Gemini. Lower it (e.g. 5) if you still see 429 errors.
+LLM_RPM=8
 ```
 
 ---
@@ -97,27 +91,17 @@ python app.py --company "Apple Inc" --fy "FY 2024" --country "United States"
 | `--fy` | Target reporting period / fiscal year | *(Required)* |
 | `--country` | Governing jurisdiction / country | `""` |
 | `--scope` | Reporting scope (`consolidated` or `standalone`) | `consolidated` |
-| `--model` | Model specifier (e.g. `ollama:gpt-oss:20b`, `google_genai:gemini-3.5-flash-lite`) | Auto-resolved from `.env` |
+| `--model` | Gemini model name (e.g. `gemini-2.5-flash`) | `GEMINI_MODEL` from `.env` |
 | `--auto-approve` | Bypass HITL prompts (intended for automated testing/eval) | `False` |
 | `--resume` | Resume an interrupted run from existing thread checkpointer | `False` |
-| `--pdf` | Generate high-resolution PDF publication | `True` |
-| `--dossier` | Path to a local JSON/text dossier for cold-start companies | `None` |
+| `--pdf` | Optional local company PDF to use as source material | `None` |
+| `--dossier` | Path to a local JSON/text dossier for company-provided information | `None` |
+| `--peer-report` | Optional local report used for structure and presentation only | `None` |
 
 ---
 
-## Verification & Testing
-
-Run all unit and integration test suites:
+## Verification
 ```bash
-# 1. Run tools unit tests (guards, domain whitelist, ledger digit verification)
-python -m unittest tests/test_tools.py
-
-# 2. Run human-in-the-loop & SQLite checkpointer resume test
-python -m unittest tests/test_hitl_resume.py
-
-# 3. Run autonomous end-to-end integration test
-python -m unittest tests/test_end_to_end.py
-
-# 4. Run full regression test suite
-python -m unittest test_suite.py
+python check_setup.py
 ```
+While it runs, app.py prints a size line after every draft, e.g. `Drafted 12 sections, 18,400 words = about 53 pages (limit 500)`.

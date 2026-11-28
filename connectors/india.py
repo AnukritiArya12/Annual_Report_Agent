@@ -29,7 +29,7 @@ class IndiaBseNseConnector(SourceConnector):
 
             seen_urls = set()
             for q in queries:
-                hits = self.tools.search(q, max_results=4) if self.tools else []
+                hits = self.tools.web_search(q, max_results=4) if self.tools else []
                 for h in hits:
                     url = h.get("href", "")
                     title = h.get("title", "")
@@ -38,17 +38,25 @@ class IndiaBseNseConnector(SourceConnector):
                     seen_urls.add(url)
 
                     is_pdf = url.lower().split("?")[0].endswith(".pdf")
-                    is_announcement = any(d in url.lower() for d in ("bseindia.com", "nseindia.com", "mca.gov.in"))
+                    domain = re.sub(r"^www\.", "", re.sub(r"^https?://", "", url.lower()).split("/", 1)[0])
+                    official_domain = any(domain == d or domain.endswith("." + d)
+                                          for d in ("bseindia.com", "nseindia.com", "mca.gov.in"))
+                    title_text = f"{title} {h.get('body', '')}"
+                    entity_tokens = [t.lower() for t in re.findall(r"[a-z0-9]+", company)
+                                     if t.lower() not in {"limited", "ltd", "private", "pvt", "company", "co"}]
+                    entity_match = bool(entity_tokens) and all(t in title_text.lower() or t in url.lower() for t in entity_tokens)
+                    period_match = bool(target_year and target_year in (title_text + " " + url))
 
-                    if is_announcement or is_pdf:
-                        conf = 0.88 if (target_year and target_year in (title + " " + url)) else 0.70
+                    if official_domain and is_pdf and entity_match:
+                        conf = 0.90 if period_match else 0.65
                         candidates.append(CandidateDocument(
                             url=url,
                             title=title or f"{company} Annual Report ({fy})",
                             period=target_year or fy,
                             confidence=conf,
                             source_name="BSE / NSE India",
-                            raw_data={"snippet": h.get("body", "")}
+                            raw_data={"snippet": h.get("body", ""), "entity_match": entity_match,
+                                      "period_match": period_match, "official_domain": official_domain}
                         ))
 
             return candidates[:5]

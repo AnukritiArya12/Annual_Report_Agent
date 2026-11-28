@@ -7,11 +7,9 @@ and Word documents (.docx) into structured page-tagged chunks.
 from __future__ import annotations
 
 import io
-import math
 import os
 import re
-from collections import Counter
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from config import settings
 from tools import rows_to_markdown
@@ -129,19 +127,6 @@ def parse_docx(path: str) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str, i
     return pages, toc, len(pages)
 
 
-def contents_text_from(toc: List[Tuple[int, str, int]], pages: List[Tuple[int, str]], max_chars: int = 7000) -> str:
-    """The document's own table of contents, as text (bookmarks if present, else the 'Contents' page)."""
-    if toc:
-        lines = [f"{'  ' * (lvl - 1)}{title} (p.{pg})" for lvl, title, pg in toc if lvl <= 3]
-        return "\n".join(lines)[:max_chars]
-    found = []
-    for page_no, text in pages[:15]:
-        head = text[:400].lower()
-        if "contents" in head or "table of content" in head or "index" in head[:120]:
-            found.append(text)
-    return "\n\n".join(found)[:max_chars]
-
-
 def _html_to_pages(text: str, words_per_page: int = 500) -> List[Tuple[int, str]]:
     """Pseudo-pages from structured text. Tables are never cut; long prose is split by words."""
     blocks: List[str] = []
@@ -166,42 +151,3 @@ def _html_to_pages(text: str, words_per_page: int = 500) -> List[Tuple[int, str]
     return [(i + 1, p) for i, p in enumerate(pages)]
 
 
-def _period_tokens(fy: str) -> List[str]:
-    """'FY 2025-26' -> ['2025', '2026', '25-26'] (used to check a document is for the requested period)."""
-    years = re.findall(r"\d{4}", fy)
-    short = re.findall(r"\d{4}\s*[-–/]\s*(\d{2})", fy)
-    toks = list(years)
-    for y in years:
-        toks.append(str(int(y) + 1))
-    toks += short
-    return list(dict.fromkeys(toks))
-
-
-def _detect_fiscal_year(first_pages_text: str) -> str:
-    m = re.search(r"(?:annual report|fiscal year|financial year|year ended)[^\d]{0,40}(\d{4}(?:\s*[-–/]\s*\d{2,4})?)",
-                  first_pages_text, flags=re.I)
-    if m:
-        return re.sub(r"\s+", "", m.group(1))
-    years = re.findall(r"\b(20[0-3]\d)\b", first_pages_text)
-    return Counter(years).most_common(1)[0][0] if years else ""
-
-
-def _target_end_year(fy: str) -> Optional[int]:
-    """'FY 2024-25' -> 2025, 'FY 2025' -> 2025, '2024-2025' -> 2025."""
-    years = re.findall(r"\d{4}", fy)
-    if not years:
-        return None
-    if re.search(r"\d{4}\s*[-–/]\s*\d{2}\b", fy):
-        return int(years[0]) + 1
-    return int(years[-1])
-
-
-def _contents_from_items(text: str) -> str:
-    """Table-of-contents substitute for 10-K style filings: the 'Item N. Title' headings, in order."""
-    seen, out = set(), []
-    for m in re.finditer(r"Item\s+(\d{1,2}[A-C]?)\.?\s+([A-Z][A-Za-z ,&'\u2019\-/]{3,70})", text[:400000]):
-        key = m.group(1).upper()
-        if key not in seen:
-            seen.add(key)
-            out.append(f"Item {key}. {m.group(2).strip()}")
-    return "\n".join(out)

@@ -30,7 +30,7 @@ class InvestorRelationsCrawlerConnector(SourceConnector):
 
             seen_urls = set()
             for q in queries:
-                hits = self.tools.search(q, max_results=3) if self.tools else []
+                hits = self.tools.web_search(q, max_results=3) if self.tools else []
                 for h in hits:
                     url = h.get("href", "")
                     title = h.get("title", "")

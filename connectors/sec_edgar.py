@@ -6,7 +6,7 @@ Discovers official 10-K, 20-F, and 40-F annual filings from the US SEC EDGAR sys
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import List
 
 from config import settings
 from connectors.base import CandidateDocument, SourceConnector
@@ -65,7 +65,7 @@ class SecEdgarConnector(SourceConnector):
                 # For e.g. "FY 2024" where fiscal year ends Jan/Feb/Mar 2025
                 target_years.add(str(int(years_in_fy[0]) + 1))
 
-            for form, acc, doc, rep, filed in annual[:8]:
+            for form, acc, doc, rep, filed in annual:
                 doc_year = str(rep)[:4]
                 doc_month = int(str(rep)[5:7]) if len(str(rep)) >= 7 and str(rep)[5:7].isdigit() else 12
                 url = f"https://www.sec.gov/Archives/edgar/data/{int(cik10)}/{acc.replace('-', '')}/{doc}"
@@ -84,7 +84,11 @@ class SecEdgarConnector(SourceConnector):
                     raw_data={"cik": cik10, "form": form, "accession": acc, "reportDate": rep, "filingDate": filed,
                               "registrant": best.get("title")}
                 ))
-            candidates.sort(key=lambda c: -c.confidence)
-            return candidates[:5]
+            candidates.sort(key=lambda c: (-c.confidence, c.period))
+            # Preserve target-period matches even when the filing is older than the
+            # most recent eight submissions; include a few adjacent filings for context.
+            exact_candidates = [c for c in candidates if c.confidence >= 0.95]
+            adjacent_candidates = [c for c in candidates if c.confidence < 0.95]
+            return (exact_candidates[:5] + adjacent_candidates[:2])
         except Exception:
             return []

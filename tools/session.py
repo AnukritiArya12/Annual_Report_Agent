@@ -10,7 +10,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from ledger import FactsLedger
@@ -26,13 +26,16 @@ class ReportSession:
     financial_year: str
     country: str = ""
     reporting_scope: str = "consolidated"
+    industry: str = ""
+    is_first_year: bool = False
     auto_approve: bool = False
 
     # Lazy / initialized engines
     storage: Optional[DatabaseStorageEngine] = None
     ledger: Optional[FactsLedger] = None
     research_tools: Optional[ResearchTools] = None
-    llm: Optional[object] = None
+    peer_report_path: Optional[str] = None
+    peer_report_outline: str = ""
 
     # Identity & guardrail state
     approved_names: List[str] = field(default_factory=list)
@@ -55,7 +58,7 @@ class ReportSession:
         if self.storage is None:
             self.storage = DatabaseStorageEngine(run_dir=self.run_dir)
         if self.ledger is None:
-            self.ledger = FactsLedger(storage=self.storage, llm=self.llm)
+            self.ledger = FactsLedger(storage=self.storage)
         if not self.approved_names and self.company_name:
             self.approved_names = [self.company_name]
         self._load_persisted_decisions()

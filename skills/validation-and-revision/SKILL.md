@@ -1,31 +1,67 @@
 ---
 name: validation-and-revision
-description: Audit drafted sections for hallucinations, entity leakage, repetition, and formatting before final compilation.
+description: Multi-tier auditing protocol covering section quality, entity leakage prevention, financial statement arithmetic, compliance auditing, and multi-format document assembly.
 ---
 
-# Validation and Revision Skill
+# Validation, Auditing & Report Assembly Skill
 
-## NAME
-validation-and-revision
+## Objective
+Audit all drafted sections for factual accuracy, consistency, zero competitor leakage, and mathematical integrity before compiling the final multi-format corporate annual report (Markdown, DOCX, and PDF).
 
-## OBJECTIVE
-Subject every drafted section to dual-pass deterministic validation (entity guard, repetition check, table formatting, and ledger consistency), interpreting tool feedback and executing corrective edits before marking a section ready for assembly.
+---
 
-## DECISION RULES
-1. **Auditor Subagent Delegation**: The coordinator can delegate comprehensive review of drafted chapters to the `compliance_auditor` subagent via `task(subagent_type="compliance_auditor", prompt=...)`. The auditor independently inspects the disk draft, executes verification checks, and returns an actionable audit report.
-2. **Always Call `check_section`**: Once a draft is written to disk, call `check_section` passing the section content, section title, and evidence excerpts.
-3. **Always Call `check_entities`**: Ensure no competitor names, unapproved subsidiaries, or stray corporate entities entered the narrative from pre-training memory.
-4. **Handle Audit Statuses**:
-   - `PASS`: Proceed to next chapter.
-   - `WARNING`: Log the warning, verify no factual distortion, proceed.
-   - `FAIL`: Examine the listed `issues`. Identify whether the failure is caused by (a) repetition, (b) ungrounded numbers, (c) blank table cells, or (d) ledger mismatch.
-5. **Execute Targeted Edits**: Use `edit_file` to fix specific failing paragraphs or tables rather than rewriting the entire section blindly.
-6. **Re-Validate**: Always call `check_section` again after revising until it returns `PASS`.
-7. **Verify Regulatory Coverage**: Before calling `assemble_report`, call `check_regulatory_coverage` to verify all statutory and industry peer requirements are met on disk. Address any missing statutory disclosures.
+## 1. Multi-Tier Auditing Protocol
 
-## CONSTRAINTS
-- A section with unresolved `FAIL` status must never be included in the final report assembly.
-- Do not bypass entity flags. If an external entity is genuinely relevant (e.g., an independent statutory auditor or major technology partner), request human approval to whitelist the entity via `request_human_decision`.
+### Tier 1: Section-Level Quality Check
+- Run `check_section(markdown=..., section_name="<slug>", evidence_excerpts=[...])` on every drafted chapter.
+- **Verifies**:
+  - Minimum substantive depth (detects empty or stub sections).
+  - Repetition and redundancy (flags >15% shingle overlap with earlier drafted sections).
+  - Table integrity (flags blank or malformed cells).
+  - Numeric alignment with canonical facts ledger.
 
-## RECOVERY
-- If a section cannot achieve `PASS` due to conflicting evidence in source documents, call `request_human_decision` to resolve the conflict with human input.
+### Tier 2: Entity Isolation & Anti-Leakage Check
+- Run `check_entities(markdown=...)` on the corporate profile and all drafted chapters.
+- **Verifies**:
+  - Prevents accidental copying of peer company names, competitor metrics, or unrelated entities into the target company's report.
+  - Ensures peer benchmarks are strictly quarantined and labeled as external context.
+
+### Tier 3: Financial Statement Arithmetic Audit
+- Run `verify_financials(markdown=...)` on all sections containing financial tables.
+- **Verifies**:
+  - Addition and subtraction across rows and columns.
+  - Balance Sheet accounting identity: $\text{Assets} = \text{Liabilities} + \text{Equity}$.
+  - Income Statement flow: $\text{Revenue} - \text{Expenses} = \text{Net Profit}$.
+  - For Banks: $\text{Interest Earned} - \text{Interest Expended} = \text{Net Interest Income (NII)}$.
+
+### Tier 4: Regulatory & Statutory Coverage Review
+- Call `check_regulatory_coverage(sector="<industry>")` to benchmark drafted topics against mandatory disclosure checklists (e.g. SEC 10-K, India Companies Act 2013, Basel III, ESG).
+- Treat missing items as candidates: include them if evidence exists, or explicitly note them as `"Not disclosed in the sources reviewed / Not provided by management"`.
+
+### Tier 5: Subagent Compliance Review
+- Delegate full report audit to `compliance_auditor` subagent:
+  `task(subagent_type="compliance_auditor", prompt="Audit drafted sections for numeric consistency, unsupported claims, and formatting...")`
+
+---
+
+## 2. Multi-Format Report Assembly
+
+Once all sections pass validation:
+
+1. **Generate Real Visual Charts**:
+   - Call `make_charts(include=True)`.
+   - Generates authentic trend charts (Revenue, Net Income, Asset Quality) saved as PNG files.
+   - If fewer than 2 data points exist, chart fabrication is suppressed to maintain truthfulness.
+
+2. **Assemble the Final Report**:
+   - Call `assemble_report(section_files=[...])`.
+   - If `section_files` is omitted, the tool automatically discovers and sequences all markdown drafts from `drafts/*.md`.
+   - **Outputs Generated**:
+     - `annual_report.md` (Clean, standardized Markdown)
+     - `annual_report.docx` (Executive Word document with formal styling, tables, headers, and footers)
+     - `annual_report.pdf` (Publication-grade PDF with table of contents, running headers, and page numbers)
+
+3. **Page Limit Management**:
+   - If `PAGE_LIMIT_EXCEEDED` is flagged:
+     - Review sections for verbosity and redundancy.
+     - Trim unnecessary filler, summarize verbose paragraphs, and reassemble.

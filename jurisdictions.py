@@ -422,6 +422,117 @@ INDUSTRY_SECTOR_BENCHMARKS: Dict[str, IndustryBenchmark] = {
         ],
         peer_structure_notes="Peer consumer reports emphasize same-store growth, store expansion plans, digital mix percentages, and working capital efficiency."
     ),
+    "energy": IndustryBenchmark(
+        sector_name="Energy, Oil & Gas, Renewables & Utilities",
+        recommended_chapters=[
+            "Corporate Profile, Energy Assets & Decarbonization Charter",
+            "Executive Review & Energy Transition Strategy",
+            "Global Energy Commodity Markets & Macro Supply Dynamics",
+            "Power Generation, Renewable Capacity (Solar/Wind) & Upstream Exploration",
+            "Transmission, Refining, Distribution & Grid Infrastructure",
+            "Health, Safety & Environment (HSE) & Scope 1/2/3 Emissions",
+            "Capital Allocation, Asset Integrity & Project Development",
+            "Corporate Governance & ESG Compliance",
+            "Financial Performance & Segment Profitability",
+            "Audited Financial Highlights",
+            "Canonical Ledger & Reserve Replacement Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Power Generation Output (MWh / GW)", "Installed Renewable Capacity (MW)",
+            "Plant Load Factor (PLF)", "Scope 1 & 2 Emissions Intensity",
+            "Gross Refining Margin (GRM)", "Capital Expenditure (CapEx)", "EBITDA Margin"
+        ],
+        specific_risk_factors=[
+            "Crude oil and energy commodity price volatility",
+            "Carbon emission taxation and environmental transition mandates",
+            "Grid connectivity delays and renewable curtailment risks",
+            "Major operational accidents, asset integrity and safety hazards"
+        ],
+        peer_structure_notes="Peer energy firms prioritize installed generation capacity, transition CapEx, plant load factors, and greenhouse gas metrics."
+    ),
+    "infrastructure": IndustryBenchmark(
+        sector_name="Real Estate, Construction & Infrastructure",
+        recommended_chapters=[
+            "Enterprise Overview & Infrastructure Project Footprint",
+            "Leadership Strategic Review & Project Pipeline",
+            "Urbanization, Infrastructure Policy & Construction Environment",
+            "Project Development, Construction Execution & EPC Delivery",
+            "Order Book Health, Bidding Pipeline & Milestone Progress",
+            "Commercial Leasing, Occupancy Rates & Rental Realizations",
+            "Quality Engineering, Contractor Safety & ESG Standards",
+            "Corporate Governance & Statutory Approvals",
+            "Financial Performance, Project Debt & Capitalized Financing",
+            "Audited Financial Statement Highlights",
+            "Canonical Facts & Project Order Book Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Order Book / Backlog", "Book-to-Bill Ratio", "Area Under Development (Sq. Ft.)",
+            "Presales / Booking Value", "Occupancy Rate %", "Debt-to-Equity", "EBITDA Margin"
+        ],
+        specific_risk_factors=[
+            "Project execution delays, cost escalation, and contractor disputes",
+            "Interest rate cycles impacting financing and debt servicing",
+            "Land acquisition clearances, zoning, and environmental permits",
+            "Working capital liquidity constraints and billing milestones"
+        ],
+        peer_structure_notes="Peer infrastructure reports emphasize unexecuted order backlog, book-to-bill ratios, construction execution velocity, and debt structure."
+    ),
+    "telecom": IndustryBenchmark(
+        sector_name="Telecommunications, 5G & Digital Connectivity",
+        recommended_chapters=[
+            "Corporate Profile, Digital Vision & Network Architecture",
+            "CEO & Board Strategic Review",
+            "Telecom Industry Trends, Data Consumption & Spectrum Landscape",
+            "Wireless, Broadband & Enterprise Network Operations",
+            "5G Rollout, Fiber Footprint & Network Coverage",
+            "Digital Ecosystem, Platforms & Customer Experience",
+            "Cybersecurity, Network Resilience & Privacy Governance",
+            "Corporate Governance & Telecom Regulatory Compliance",
+            "Financial Performance, ARPU & Operating Returns",
+            "Audited Financial Statement Highlights",
+            "Canonical Ledger & Spectrum Disclosures Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Average Revenue Per User (ARPU)", "Total Subscriber Base",
+            "Monthly Data Usage per Customer (GB)", "5G Tower Deployments",
+            "Fiber Home Passes", "Churn Rate %", "EBITDA Margin"
+        ],
+        specific_risk_factors=[
+            "High spectrum acquisition debt and capital expenditure requirements",
+            "Intense tariff competition and promotional pricing pressures",
+            "Regulatory license fees, spectrum compliance, and AGR obligations",
+            "Critical network outages and cyber attack threats on telecom cores"
+        ],
+        peer_structure_notes="Peer telecom companies focus heavily on ARPU trajectory, data usage growth, spectrum holding schedules, and 5G deployment progress."
+    ),
+    "logistics": IndustryBenchmark(
+        sector_name="Logistics, Transportation & Supply Chain",
+        recommended_chapters=[
+            "Enterprise Profile, Global Multimodal Network & Hubs",
+            "Leadership Review & Supply Chain Strategy",
+            "Global Trade Corridors, Freight Rates & Freight Environment",
+            "Multimodal Operations (Air, Ocean, Road, Rail) & Warehousing",
+            "Fleet Management, Asset Utilization & Turnaround Efficiency",
+            "Digital Logistics, Real-Time Tracking & Warehouse Automation",
+            "Operational Safety, Fleet Decarbonization & Green Logistics",
+            "Corporate Governance & Customs Compliance",
+            "Financial Results, Freight Margins & Working Capital",
+            "Audited Statement Highlights",
+            "Canonical Ledger Appendix"
+        ],
+        key_metrics_and_kpis=[
+            "Freight Volume Handled (TEUs / Tons)", "Warehousing Area (Sq. Ft.)",
+            "Fleet Utilization Rate %", "Fuel Surcharge Recovery %",
+            "On-Time In-Full (OTIF) Delivery %", "Operating Margin", "Cash Flow from Operations"
+        ],
+        specific_risk_factors=[
+            "Global freight rate swings and container shipping bottlenecks",
+            "Fuel price volatility and fleet inflation",
+            "Driver/crew availability and cross-border trade tariffs",
+            "Warehouse cargo security and supply chain disruption"
+        ],
+        peer_structure_notes="Peer logistics companies detail warehousing capacity, freight volumes, fleet utilization, and fuel pass-through mechanisms."
+    ),
     "generic": IndustryBenchmark(
         sector_name="General Corporate Enterprise",
         recommended_chapters=[
@@ -453,16 +564,43 @@ def get_industry_benchmark(sector_or_industry: Optional[str] = None) -> Industry
     if not sector_or_industry:
         return INDUSTRY_SECTOR_BENCHMARKS["generic"]
     
-    sec_clean = sector_or_industry.strip().lower()
-    if any(k in sec_clean for k in ("bank", "finance", "lending", "credit", "nbf", "loan")):
-        return INDUSTRY_SECTOR_BENCHMARKS["banking"]
-    if any(k in sec_clean for k in ("tech", "software", "saas", "it", "cloud", "digital", "data", "robotics", "ai", "hardware")):
-        return INDUSTRY_SECTOR_BENCHMARKS["technology"]
-    if any(k in sec_clean for k in ("manufactur", "auto", "industrial", "steel", "engineering", "cement", "chemical")):
-        return INDUSTRY_SECTOR_BENCHMARKS["manufacturing"]
-    if any(k in sec_clean for k in ("pharma", "health", "biotech", "drug", "medicine", "clinical", "hospital")):
+    sec_clean = re.sub(r"[^a-z0-9]+", " ", sector_or_industry.lower()).strip()
+    toks = sec_clean.split()
+
+    # 1. Healthcare & Life Sciences (checked before Tech to capture Biotech correctly)
+    if any(k in sec_clean for k in ("pharma", "biotech", "health", "hospital", "drug", "clinical", "therapeutic", "medical", "medicine")):
         return INDUSTRY_SECTOR_BENCHMARKS["healthcare"]
-    if any(k in sec_clean for k in ("retail", "consumer", "ecommerce", "fmcg", "store", "apparel", "food")):
+
+    # 2. Banking, Lending & Financial Services
+    if any(k in sec_clean for k in ("bank", "finance", "lending", "credit", "nbfc", "nbf", "loan", "fund", "wealth", "asset management", "insurance")):
+        return INDUSTRY_SECTOR_BENCHMARKS["banking"]
+
+    # 3. Energy, Oil, Gas & Utilities
+    if any(k in sec_clean for k in ("energy", "oil", "gas", "power", "renewable", "solar", "wind", "utility", "utilities", "petroleum", "petro")):
+        return INDUSTRY_SECTOR_BENCHMARKS["energy"]
+
+    # 4. Infrastructure, Real Estate & Construction
+    if any(k in sec_clean for k in ("infra", "infrastructure", "construction", "real estate", "property", "reit", "building", "epc")):
+        return INDUSTRY_SECTOR_BENCHMARKS["infrastructure"]
+
+    # 5. Telecommunications & Connectivity
+    if any(k in sec_clean for k in ("telecom", "telecommunication", "broadband", "cellular", "wireless", "spectrum", "5g", "network")):
+        return INDUSTRY_SECTOR_BENCHMARKS["telecom"]
+
+    # 6. Logistics, Freight & Transportation
+    if any(k in sec_clean for k in ("logistic", "logistics", "transport", "freight", "shipping", "cargo", "courier", "aviation", "airline", "fleet")):
+        return INDUSTRY_SECTOR_BENCHMARKS["logistics"]
+
+    # 7. Retail, Consumer Goods & E-Commerce
+    if any(k in sec_clean for k in ("retail", "consumer", "commerce", "store", "fmcg", "apparel", "food", "fashion")):
         return INDUSTRY_SECTOR_BENCHMARKS["retail"]
+
+    # 8. Technology, Software, SaaS & IT Services
+    if any(k in sec_clean for k in ("tech", "software", "saas", "it services", "cloud", "digital", "data", "robotics", "ai", "hardware", "cyber")):
+        return INDUSTRY_SECTOR_BENCHMARKS["technology"]
+
+    # 9. Manufacturing & Automotive
+    if any(k in sec_clean for k in ("manufactur", "auto", "automotive", "industrial", "steel", "engineering", "cement", "chemical", "factory")):
+        return INDUSTRY_SECTOR_BENCHMARKS["manufacturing"]
 
     return INDUSTRY_SECTOR_BENCHMARKS["generic"]

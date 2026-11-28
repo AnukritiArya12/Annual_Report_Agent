@@ -104,7 +104,7 @@ class FinancialVerifier:
                     continue
 
                 is_subtotal = any(k in label for k in ("subtotal", "sub-total", "total current", "total non-current", "operating income", "total operating expenses"))
-                is_grand_total = any(k in label for k in ("total assets", "total liabilities and", "total liabilities &", "net income", "total revenue", "total expenses", "aggregate", "grand total")) or (not is_subtotal and any(k in label for k in ("total", "sum of", "net assets")))
+                is_grand_total = any(k in label for k in ("total assets", "total liabilities and", "total liabilities &", "total revenue", "total expenses", "aggregate", "grand total")) or (not is_subtotal and any(k in label for k in ("total", "sum of", "net assets")))
 
                 if is_subtotal and components_count >= 1:
                     diff = abs(running_sum - val)

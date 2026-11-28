@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from langchain_core.tools import BaseTool, tool
 
 from config import settings
@@ -121,8 +121,9 @@ def build_validation_tools(session: ReportSession) -> List[BaseTool]:
             body,
             names=session.approved_names,
             excluded=session.excluded_names,
+            evidence_text=" ".join(evidence_excerpts or []),
             statuses=session.entity_statuses,
-            check_evidence=False,
+            check_evidence=bool(evidence_excerpts),
         )
         for disp, _, reason in flagged:
             issues.append(f"Entity guard flagged '{disp}': {reason}")
@@ -142,10 +143,10 @@ def build_validation_tools(session: ReportSession) -> List[BaseTool]:
 
     @tool
     def check_regulatory_coverage(sector: str = "") -> str:
-        """Audit drafted chapters against a source-backed matrix of statutory & industry requirements.
+        """Compare drafts with the local jurisdiction registry and optional sector guidance.
 
-        Checks whether all mandatory statutory sections for the jurisdiction and standard
-        peer chapters for the industry sector are covered on disk. Flags missing or uncertain items.
+        Registry and industry matches are screening aids only. Verify applicability against
+        authoritative rules before treating anything as mandatory or complete.
         """
         import glob
         juri = get_jurisdiction(session.country)
@@ -197,7 +198,8 @@ def build_validation_tools(session: ReportSession) -> List[BaseTool]:
             else:
                 missing_sections.append({"requirement": m.title, "type": "Statutory Mandate", "purpose": m.purpose, "kind": m.kind})
 
-        # 2. Industry sector benchmark chapters check
+        # 2. Industry guidance is advisory and never counted as a statutory requirement.
+        industry_topics: List[Dict[str, Any]] = []
         for ch in sec_bm.recommended_chapters:
             ch_clean = ch.lower()
             toks = [t for t in re.findall(r"[a-z0-9]+", ch_clean) if len(t) >= 4]
@@ -210,33 +212,30 @@ def build_validation_tools(session: ReportSession) -> List[BaseTool]:
             if matched_file:
                 wc = word_count(drafts_text[matched_file])
                 if wc >= 80:
-                    met_sections.append({"requirement": ch, "type": "Industry Benchmark", "file": matched_file, "word_count": wc})
+                    industry_topics.append({"topic": ch, "status": "mentioned", "file": matched_file, "word_count": wc})
                 else:
-                    uncertain_sections.append({
-                        "requirement": ch,
-                        "type": "Industry Benchmark",
-                        "file": matched_file,
-                        "issue": f"Coverage is brief ({wc} words).",
-                    })
+                    industry_topics.append({"topic": ch, "status": "briefly_mentioned", "file": matched_file, "word_count": wc})
             else:
-                missing_sections.append({"requirement": ch, "type": "Industry Benchmark", "purpose": "Sector peer disclosure standard", "kind": "narrative"})
+                industry_topics.append({"topic": ch, "status": "not_found", "advisory": True})
 
-        total_req = len(juri.mandatory_sections) + len(sec_bm.recommended_chapters)
+        total_req = len(juri.mandatory_sections)
         cov_score = round(len(met_sections) / max(1, total_req), 2)
-        ready = (cov_score >= 0.40) and not any(m["type"] == "Statutory Mandate" for m in missing_sections)
 
         return json.dumps({
             "jurisdiction": f"{juri.country_name} ({juri.regime_name})",
             "statute": juri.governing_statute,
             "industry_sector": sec_bm.sector_name,
-            "coverage_score": cov_score,
-            "is_ready_for_assembly": ready,
-            "met_requirements_count": len(met_sections),
-            "missing_count": len(missing_sections),
+            "registry_match_ratio": cov_score,
+            "is_legal_compliance_certified": False,
+            "review_note": "Local registry coverage is incomplete and matching is heuristic. Check authoritative rules for entity status, framework, period, and applicability. This tool cannot certify compliance.",
+            "met_registry_matches_count": len(met_sections),
+            "missing_registry_matches_count": len(missing_sections),
             "uncertain_count": len(uncertain_sections),
             "met_sample": met_sections[:8],
             "missing_sections": missing_sections[:8],
             "uncertain_sections": uncertain_sections,
+            "industry_guidance_is_advisory": True,
+            "industry_topics": industry_topics,
         }, indent=2)
 
     return [check_entities, check_section, check_regulatory_coverage]

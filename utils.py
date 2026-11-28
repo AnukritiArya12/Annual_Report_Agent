@@ -1,18 +1,7 @@
 """Small shared helpers (text cleaning, JSON extraction, similarity)."""
 
-import json
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-
-
-def clean_llm_text(text: str) -> str:
-    """Remove reasoning blocks and an outer code fence from an LLM reply."""
-    text = text or ""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)  # unclosed opener
-    text = text.strip()
-    m = re.match(r"^```(?:markdown|md|json)?\s*\n(.*?)\n```$", text, flags=re.DOTALL)
-    return (m.group(1) if m else text).strip()
+from typing import Any, List, Optional, Sequence, Set, Tuple
 
 
 _INJECTION_LINE_PATTERNS = [
@@ -73,29 +62,6 @@ def sanitize_untrusted(text: str, log_removals: bool = True) -> str:
     return "\n".join(safe_lines)
 
 
-def extract_json(text: str) -> Any:
-    """Return the largest valid JSON object/array embedded in an LLM reply."""
-    text = clean_llm_text(text)
-    text = re.sub(r"```(?:json)?", "", text)
-    decoder = json.JSONDecoder()
-    best = None
-    best_len = -1
-    pos = 0
-    for m in re.finditer(r"[\{\[]", text):
-        if m.start() < pos:
-            continue
-        try:
-            obj, end = decoder.raw_decode(text[m.start():])
-        except ValueError:
-            continue
-        if isinstance(obj, (dict, list)) and end > best_len:
-            best, best_len = obj, end
-        pos = m.start() + end
-    if best is None:
-        raise ValueError("No valid JSON found in LLM output")
-    return best
-
-
 def slug(text: str, n: int = 40) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")[:n] or "item"
 
@@ -116,19 +82,6 @@ def shingle_set(text: str, n: int = 5) -> Set[int]:
     if len(toks) < n:
         return set()
     return {hash(" ".join(toks[i:i + n])) for i in range(len(toks) - n + 1)}
-
-
-def digest(text: str, max_chars: int = 400) -> str:
-    """Short prose digest of a section (skips headings/tables) for the coverage ledger."""
-    lines = [l.strip() for l in (text or "").splitlines()
-             if l.strip() and not l.strip().startswith(("#", "|", "*Sources"))]
-    out = " ".join(lines)
-    out = re.sub(r"\s+", " ", out)
-    return out[:max_chars] + ("..." if len(out) > max_chars else "")
-
-
-# Sections whose evidence was missing are replaced by this one-line notice instead of tables full of "Not disclosed".
-SPARSE_MARK = "*Not available in the public sources reviewed."
 
 
 # =====================================================================================================
@@ -159,33 +112,8 @@ def org_core(name: str) -> str:
     return " ".join(t for t in toks if t not in _CORP_WORDS)
 
 
-_SPACY_NLP = None
-_SPACY_CHECKED = False
-
-
-def _get_spacy_model():
-    """Load spaCy model if available and enabled, skipping silently otherwise."""
-    global _SPACY_NLP, _SPACY_CHECKED
-    if _SPACY_CHECKED:
-        return _SPACY_NLP
-    _SPACY_CHECKED = True
-    try:
-        from config import settings
-        if not getattr(settings, "SPACY_NER_ENABLED", False):
-            return None
-        import spacy
-        _SPACY_NLP = spacy.load("en_core_web_sm")
-    except Exception:
-        _SPACY_NLP = None
-    return _SPACY_NLP
-
-
 def find_org_names(text: str, allow_list: Optional[Sequence[str]] = None) -> List[str]:
-    """Organisation names in text using a layered check:
-    (a) allow-list filtering for confirmed identity components,
-    (b) optional spaCy NER (`en_core_web_sm` ORG entities, skipped silently if missing),
-    (c) regex fallback capturing entities with corporate suffixes, plus any configured EXTRA_ORG_NAMES.
-    """
+    """Organisation names in text (regex on corporate suffixes), skipping names in the allow-list."""
     body = (text or "").split("*Sources:")[0]
     body = re.sub(r",\s+(?=(?:Inc|Corp|Ltd|LLC|LLP|PLC|plc|Limited|Corporation|Co)\b)", " ", body)
     out: List[str] = []
@@ -193,22 +121,7 @@ def find_org_names(text: str, allow_list: Optional[Sequence[str]] = None) -> Lis
 
     allow_cores = set(_company_cores(allow_list or []))
 
-    # Layer (b): Optional spaCy NER
-    nlp = _get_spacy_model()
-    if nlp is not None:
-        try:
-            doc = nlp(body[:15000])
-            for ent in doc.ents:
-                if ent.label_ in ("ORG", "COMPANY"):
-                    disp = ent.text.strip()
-                    core = org_core(disp)
-                    if core and core not in seen and core not in allow_cores:
-                        seen.add(core)
-                        out.append(disp)
-        except Exception:
-            pass
-
-    # Layer (c): Fallback 1 - Suffix regex
+    # Organisation names written with a corporate suffix (Inc, Ltd, Limited, Group, ...)
     for m in _ORG_RE.finditer(body):
         words = m.group(1).split()
         while words and words[0].lower().strip(".") in _LEAD_STOP:
@@ -219,21 +132,6 @@ def find_org_names(text: str, allow_list: Optional[Sequence[str]] = None) -> Lis
             continue
         seen.add(core)
         out.append(disp)
-
-    # Layer (c): Fallback 2 - Optional configured extra org names (zero hardcoded names)
-    try:
-        from config import settings
-        extra_orgs = {o.lower() for o in getattr(settings, "EXTRA_ORG_NAMES", ())}
-    except Exception:
-        extra_orgs = set()
-    if extra_orgs:
-        word_tokens = re.findall(r"\b[A-Z][a-zA-Z0-9&'\-.]*\b", body)
-        for w in word_tokens:
-            if w.lower() in extra_orgs:
-                core = org_core(w)
-                if core and core not in seen and core not in allow_cores:
-                    seen.add(core)
-                    out.append(w)
 
     return out
 

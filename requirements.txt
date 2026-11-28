@@ -3,13 +3,10 @@ deepagents==0.7.35
 langchain>=1.4.9
 langchain-core>=1.7.6
 langgraph>=1.2.20
+langgraph-checkpoint-sqlite
 
 # Model Provider Connectors
 langchain-google-genai>=4.4.3
-langchain-openai>=1.7.4
-langchain-anthropic>=1.7.10
-langchain-ollama>=1.1.0
-google-genai>=3.0.0
 
 # Ingestion, Retrieval & Analysis
 requests
@@ -23,6 +20,7 @@ reportlab
 chromadb>=0.4
 pytesseract
 pillow
-lxml
-rank_bm25
 matplotlib
+
+# Web UI
+streamlit>=1.35.0

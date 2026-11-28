@@ -12,12 +12,9 @@ directly into the final section markdown so LLMs never fabricate or alter financ
 
 from __future__ import annotations
 
-import json
-import re
 import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from config import settings
 from ledger import FactsLedger
 
 
@@ -47,16 +44,7 @@ class FinancialStatementBuilder:
             lines.append(f"| Total Liabilities | {curr_prefix}{liab} | Primary Reported Metric |")
         if equity:
             lines.append(f"| Total Stockholders' / Shareholders' Equity | {curr_prefix}{equity} | Primary Reported Metric |")
-        if liab and equity and not facts_dict.get("total_liabilities_and_equity"):
-            # If numeric components exist, calculate sum
-            try:
-                l_num = float(re.sub(r"[^\d.]", "", str(liab)))
-                e_num = float(re.sub(r"[^\d.]", "", str(equity)))
-                tot = l_num + e_num
-                lines.append(f"| **Total Liabilities and Stockholders' Equity** | {curr_prefix}{tot:,.2f} | Arithmetically Reconciled |")
-            except Exception:
-                pass
-        elif facts_dict.get("total_liabilities_and_equity"):
+        if facts_dict.get("total_liabilities_and_equity"):
             lines.append(f"| **Total Liabilities and Stockholders' Equity** | {curr_prefix}{facts_dict['total_liabilities_and_equity']} | Primary Reported Metric |")
 
         return "\n".join(lines)
@@ -129,6 +117,17 @@ def extract_structured_statements(storage_engine) -> Dict[str, str]:
     ledger = FactsLedger(storage_engine)
     facts = ledger.get_all_facts()
     if facts:
+        # A compact statement summary must not collapse distinct reporting periods
+        # into one row per key. Use the most represented single period.
+        period_counts: Dict[str, int] = {}
+        for fact in facts:
+            if getattr(fact.status, "value", str(fact.status)) not in {"REPORTED", "DERIVED"}:
+                continue
+            period_counts[fact.period] = period_counts.get(fact.period, 0) + 1
+        if period_counts:
+            selected_period = max(period_counts, key=period_counts.get)
+            facts = [f for f in facts if f.period == selected_period
+                     and getattr(f.status, "value", str(f.status)) in {"REPORTED", "DERIVED"}]
         facts_map: Dict[str, str] = {}
         period = facts[0].period if facts else "Target FY"
         currency = facts[0].currency if facts else ""
@@ -172,15 +171,3 @@ def extract_structured_statements(storage_engine) -> Dict[str, str]:
     return out
 
 
-def get_statement_for_task(task_title: str, structured_statements: Dict[str, str]) -> Optional[str]:
-    """Match task title to a corresponding pre-built deterministic financial statement table."""
-    if not structured_statements:
-        return None
-    t_low = task_title.lower()
-    if any(k in t_low for k in ("balance sheet", "financial position", "assets and liabilities")):
-        return structured_statements.get("balance_sheet")
-    if any(k in t_low for k in ("income statement", "profit and loss", "profit & loss", "financial performance", "statement of operations")):
-        return structured_statements.get("income_statement")
-    if any(k in t_low for k in ("cash flow", "cash flows", "liquidity and capital")):
-        return structured_statements.get("cash_flow")
-    return None

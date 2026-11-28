@@ -19,7 +19,7 @@ def build_retrieval_tools(session: ReportSession) -> List[BaseTool]:
     def search_evidence(query: str, k: int = 6) -> str:
         """Hybrid search (SQLite FTS5 keyword + ChromaDB vector search with RRF and table boost).
 
-        Returns verified evidence chunks with chunk_id, page, source document, and text.
+        Returns company-matched evidence candidates with chunk_id, page, source document, and text.
         GUARDRAIL: Automatically drops chunks belonging to excluded/forbidden entities or unapproved domains.
         """
         raw_hits = session.storage.search(query, k=max(1, k * 2))
@@ -38,6 +38,8 @@ def build_retrieval_tools(session: ReportSession) -> List[BaseTool]:
             results.append({
                 "chunk_id": chunk.chunk_id,
                 "doc_id": chunk.doc_id,
+                "source_title": chunk.doc_title,
+                "source_url": chunk.url,
                 "page": chunk.page,
                 "is_table": bool(chunk.is_table),
                 "score": round(float(score), 4),

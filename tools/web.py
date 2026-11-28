@@ -6,7 +6,6 @@ import os
 import re
 import sqlite3
 import time
-from urllib.parse import urljoin
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -125,21 +124,6 @@ class ResearchTools:
             self.last_search_error = f"Wikipedia search: {e}"
             return []
 
-    def get_wikipedia_extract(self, title: str) -> str:
-        """Fetch full plain text extract of a Wikipedia article."""
-        try:
-            url = "https://en.wikipedia.org/w/api.php"
-            params = {"action": "query", "prop": "extracts", "explaintext": 1, "titles": title, "format": "json"}
-            headers = {"User-Agent": "AnnualReportAgent/1.0 (academic/research; contact@example.com)"}
-            r = requests.get(url, params=params, headers=headers, timeout=15)
-            if r.ok:
-                pages = r.json().get("query", {}).get("pages", {})
-                for pid, p in pages.items():
-                    if "extract" in p:
-                        return p["extract"]
-            return ""
-        except Exception:
-            return ""
 
     def search_yahoo_finance(self, q: str, max_results: int = 5) -> List[Dict[str, str]]:
         """Search Yahoo Finance API for ticker, legal name, sector, and investor relations news."""
@@ -190,7 +174,7 @@ class ResearchTools:
     def fetch_text(self, url: str, headers: Optional[dict] = None, max_chars: int = 1_500_000,
                    timeout: int = 60) -> str:
         """Fetch an HTML page and return its visible text (no size limit beyond max_chars)."""
-        h = {"User-Agent": _UA}
+        h = {"User-Agent": settings.SEC_USER_AGENT if "sec.gov" in url else _UA}   # SEC blocks browser-like agents
         h.update(headers or {})
         try:
             r = requests.get(url, headers=h, timeout=timeout)
@@ -200,7 +184,20 @@ class ResearchTools:
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup(["script", "style", "noscript", "ix:header"]):
                 tag.decompose()
+            # Keep real tables as Markdown (the facts ledger and statement builder read "| label | value |" rows)
+            tables: List[str] = []
+            for tb in soup.find_all("table"):
+                try:
+                    rows = [[c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])] for tr in tb.find_all("tr")]
+                    md = rows_to_markdown(rows)
+                except Exception:
+                    md = ""
+                if md:
+                    tb.replace_with(f" TBLMARK{len(tables)}ENDMARK ")
+                    tables.append(md)
             text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
+            for i, md in enumerate(tables):
+                text = text.replace(f"TBLMARK{i}ENDMARK", "\n\n" + md + "\n\n")
             if getattr(settings, "PROMPT_INJECTION_DEFENCE", True):
                 text = sanitize_untrusted(text)
             return text[:max_chars]
@@ -208,47 +205,6 @@ class ResearchTools:
             self.last_fetch_error = f"{url}: {str(e)[:150]}"
             return ""
 
-    def fetch_html_structured(self, url: str, headers: Optional[dict] = None, max_chars: int = 2_500_000,
-                              timeout: int = 120) -> str:
-        """Fetch an HTML page keeping its TABLES as Markdown tables (10-K filings are mostly tables).
-        Each table is preceded by a 'Table context:' line with the text just before it (its title)."""
-        h = {"User-Agent": _UA}
-        h.update(headers or {})
-        try:
-            r = requests.get(url, headers=h, timeout=timeout)
-            r.raise_for_status()
-            if "pdf" in r.headers.get("content-type", "").lower():
-                return ""
-            try:
-                soup = BeautifulSoup(r.text, "lxml")
-            except Exception:
-                soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup(["script", "style", "noscript", "ix:header"]):
-                tag.decompose()
-            for tbl in list(soup.find_all("table")):
-                try:
-                    rows = [[td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-                            for tr in tbl.find_all("tr")]
-                    md = rows_to_markdown(rows)
-                    if md:
-                        tbl.replace_with(soup.new_string(f"\n\n@@TABLE@@\n{md}\n@@/TABLE@@\n\n"))
-                except Exception:
-                    continue
-            raw = soup.get_text(" ")
-            parts = re.split(r"@@TABLE@@\n(.*?)\n@@/TABLE@@", raw, flags=re.S)
-            out, prev = [], ""
-            for i, seg in enumerate(parts):
-                if i % 2 == 0:
-                    txt = re.sub(r"\s+", " ", seg).strip()
-                    if txt:
-                        out.append(txt)
-                        prev = txt
-                else:
-                    out.append(f"Table context: {' '.join(prev.split()[-30:])}\n{seg.strip()}")
-            return "\n\n".join(out)[:max_chars]
-        except Exception as e:
-            self.last_fetch_error = f"{url}: {str(e)[:150]}"
-            return ""
 
     def fetch_json(self, url: str, headers: Optional[dict] = None, timeout: int = 60) -> Optional[Any]:
         h = {"User-Agent": _UA, "Accept": "application/json"}
@@ -261,23 +217,6 @@ class ResearchTools:
             self.last_fetch_error = f"{url}: {str(e)[:150]}"
             return None
 
-    def extract_links(self, url: str) -> List[tuple]:
-        """All (absolute_url, anchor_text) links on a page - used to find report downloads on IR pages."""
-        try:
-            r = requests.get(url, headers={"User-Agent": _UA}, timeout=30)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-        except Exception as e:
-            self.last_fetch_error = f"{url}: {str(e)[:150]}"
-            return []
-        seen, out = set(), []
-        for a in soup.find_all("a", href=True):
-            href = urljoin(url, a["href"].strip())
-            if not href.lower().startswith(("http://", "https://")) or href in seen:
-                continue
-            seen.add(href)
-            out.append((href, (a.get_text(" ", strip=True) or a.get("title", "") or "")[:160]))
-        return out
 
     def download_pdf(self, url: str, dest_dir: str) -> Optional[str]:
         """Download a PDF (size-capped). Returns the local path or None if it is not a real PDF."""
